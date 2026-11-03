@@ -12,6 +12,8 @@ struct IPABuild: Identifiable, Equatable, Sendable {
     let folderName: String
     let folderDate: String?
     let size: Int64
+    var urlSchemes: [String] = []
+    var minimumOSVersion: String? = nil
 
     var displayName: String {
         Self.folderDetails(folderName).name

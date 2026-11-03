@@ -16,6 +16,16 @@ final class OTAServer: @unchecked Sendable {
         var attempt: UUID
     }
 
+    private struct InstallSession {
+        let id: String
+        let build: IPABuild
+        let createdAt: Date
+        var sent: Int64 = 0
+        var state = "waiting"
+    }
+
+    private var sessions: [String: InstallSession] = [:]
+
     private let listener: NWListener
     private let queue = DispatchQueue(label: "ServeIPA.HTTPServer", qos: .userInitiated)
     private let lock = NSLock()
@@ -102,6 +112,16 @@ final class OTAServer: @unchecked Sendable {
         let path = encodedPath.removingPercentEncoding ?? encodedPath
         let current = lock.withLock { snapshot }
 
+        if path.hasPrefix("/api/v1/") {
+            respondToAPI(path: path, query: query, method: method, current: current, on: connection)
+            return
+        }
+
+        guard method == "GET" || method == "HEAD" || (path == "/__reset" && method == "POST") else {
+            send(status: "405 Method Not Allowed", body: Data(), contentType: "text/plain", on: connection)
+            return
+        }
+
         if path == "/" {
             let body = Self.indexPage(builds: Array(current.buildsByPath.values), publicURL: current.publicURL)
             send(status: "200 OK", body: body, contentType: "text/html; charset=utf-8", method: method, on: connection)
@@ -168,6 +188,97 @@ final class OTAServer: @unchecked Sendable {
         sendFile(build.fileURL, key: requestedBuildPath, method: method, on: connection)
     }
 
+
+    // A random session follows the manifest into the IPA URL, isolating concurrent devices.
+    private func respondToAPI(path: String, query: String, method: String, current: Snapshot, on connection: NWConnection) {
+        if path == "/api/v1/health", method == "GET" {
+            sendJSON(["service": "ServeIPA", "apiVersion": 1], on: connection)
+            return
+        }
+        if path == "/api/v1/apps", method == "GET" {
+            let apps: [[String: Any]] = current.buildsByPath.values.sorted {
+                ($0.folderDate ?? $0.folderName, $0.name) > ($1.folderDate ?? $1.folderName, $1.name)
+            }.map { build in
+                var object: [String: Any] = [
+                    "id": build.id, "name": build.name, "displayName": build.displayName,
+                    "bundleIdentifier": build.bundleIdentifier, "version": build.version,
+                    "build": build.build, "size": build.size, "platforms": build.platforms,
+                    "urlSchemes": build.urlSchemes
+                ]
+                object["date"] = build.folderDate
+                object["minimumOSVersion"] = build.minimumOSVersion
+                return object
+            }
+            sendJSON(["apiVersion": 1, "apps": apps], on: connection)
+            return
+        }
+        if path == "/api/v1/sessions", method == "POST" {
+            guard let buildID = Self.queryValue("app", in: query),
+                  let build = current.buildsByPath[buildID], let publicURL = current.publicURL else {
+                sendJSON(["error": "App unavailable"], status: "404 Not Found", on: connection)
+                return
+            }
+            let id = UUID().uuidString
+            let accepted = lock.withLock {
+                sessions = sessions.filter { Date().timeIntervalSince($0.value.createdAt) < 86_400 }
+                guard sessions.count < 1000 else { return false }
+                sessions[id] = InstallSession(id: id, build: build, createdAt: Date())
+                return true
+            }
+            guard accepted else {
+                sendJSON(["error": "Too many sessions"], status: "503 Service Unavailable", on: connection)
+                return
+            }
+            let manifestURL = publicURL.appending(path: "api/v1/sessions/\(id)/manifest").absoluteString
+            var install = URLComponents()
+            install.scheme = "itms-services"
+            install.host = ""
+            install.queryItems = [
+                URLQueryItem(name: "action", value: "download-manifest"),
+                URLQueryItem(name: "url", value: manifestURL)
+            ]
+            sendJSON([
+                "id": id,
+                "installURL": install.url?.absoluteString ?? "",
+                "downloadPath": "api/v1/sessions/\(id)/ipa"
+            ], status: "201 Created", on: connection)
+            return
+        }
+        let parts = path.split(separator: "/")
+        guard parts.count >= 4, parts[2] == "sessions",
+              let session = lock.withLock({ sessions[String(parts[3])] }),
+              Date().timeIntervalSince(session.createdAt) < 86_400 else {
+            sendJSON(["error": "Session expired or unknown"], status: "404 Not Found", on: connection)
+            return
+        }
+        if parts.count == 4, method == "GET" {
+            sendJSON([
+                "id": session.id, "sent": session.sent, "total": session.build.size,
+                "state": session.state
+            ], on: connection)
+        } else if parts.count == 5, parts[4] == "manifest", method == "GET",
+                  let publicURL = current.publicURL {
+            let ipaURL = publicURL.appending(path: "api/v1/sessions/\(session.id)/ipa")
+            guard let body = Self.manifest(for: session.build, publicURL: publicURL, downloadURL: ipaURL) else {
+                sendJSON(["error": "Invalid manifest"], status: "500 Internal Server Error", on: connection)
+                return
+            }
+            send(status: "200 OK", body: body, contentType: "application/xml", on: connection)
+        } else if parts.count == 5, parts[4] == "ipa", method == "GET" || method == "HEAD" {
+            sendFile(session.build.fileURL, key: session.id, method: method, on: connection)
+        } else {
+            sendJSON(["error": "Unsupported endpoint or method"], status: "405 Method Not Allowed", on: connection)
+        }
+    }
+
+    private func sendJSON(_ object: [String: Any], status: String = "200 OK", on connection: NWConnection) {
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
+            send(status: "500 Internal Server Error", body: Data(), contentType: "application/json", on: connection)
+            return
+        }
+        send(status: status, body: data, contentType: "application/json; charset=utf-8", on: connection)
+    }
+
     private static func queryValue(_ name: String, in query: String) -> String? {
         for pair in query.split(separator: "&") {
             let keyValue = pair.split(separator: "=", maxSplits: 1)
@@ -210,6 +321,12 @@ final class OTAServer: @unchecked Sendable {
             return
         }
         let total = size.int64Value
+        if method != "HEAD" {
+            lock.withLock {
+                sessions[key]?.state = "transferring"
+                sessions[key]?.sent = 0
+            }
+        }
 
         let attempt: UUID = lock.withLock {
             let existing = transfers[key]?.attempt ?? UUID()
@@ -257,6 +374,8 @@ final class OTAServer: @unchecked Sendable {
                 lock.withLock {
                     if transfers[key]?.attempt == attempt {
                         transfers[key]?.status = String(localized: "Transfert HTTP terminé (installation non confirmée)")
+                        sessions[key]?.state = sent == total ? "transferred" : "failed"
+                        sessions[key]?.sent = sent
                     }
                 }
                 connection.cancel()
@@ -272,25 +391,30 @@ final class OTAServer: @unchecked Sendable {
             }
             connection.send(content: chunk, completion: .contentProcessed { [weak self] error in
                 if error == nil {
+                    self?.lock.withLock {
+                        self?.sessions[key]?.sent = newSent
+                    }
                     self?.sendNextChunk(from: handle, key: key, attempt: attempt, sent: newSent, total: total, on: connection)
                 } else {
                     try? handle.close()
                     self?.lock.withLock {
                         if self?.transfers[key]?.attempt == attempt {
                             self?.transfers[key]?.status = String(localized: "Connexion interrompue")
+                            self?.sessions[key]?.state = "failed"
                         }
                     }
                     connection.cancel()
                 }
             })
         } catch {
+            lock.withLock { sessions[key]?.state = "failed" }
             try? handle.close()
             connection.cancel()
         }
     }
 
-    private static func manifest(for build: IPABuild, publicURL: URL) -> Data? {
-        let ipaURL = publicURL.appending(path: build.relativePath).absoluteString
+    private static func manifest(for build: IPABuild, publicURL: URL, downloadURL: URL? = nil) -> Data? {
+        let ipaURL = (downloadURL ?? publicURL.appending(path: build.relativePath)).absoluteString
         let object: [String: Any] = [
             "items": [[
                 "assets": [["kind": "software-package", "url": ipaURL]],

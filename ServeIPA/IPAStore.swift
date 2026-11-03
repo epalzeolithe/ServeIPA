@@ -120,13 +120,14 @@ final class IPAStore {
             serverState = .failed(String(localized: "Choisissez d’abord un dossier."))
             return
         }
-        guard serverState != .running else { return }
+        guard serverState != .running && serverState != .starting else { return }
         serverState = .starting
 
         do {
             let publicURL = try await Tailscale.publicURL()
             let newServer = try OTAServer(port: port)
             newServer.update(builds: builds, rootURL: folderURL, publicURL: publicURL)
+            server = newServer
             try newServer.start()
             try await Tailscale.serve(port: port)
             server = newServer
@@ -254,7 +255,9 @@ final class IPAStore {
                     platforms: metadata.platforms,
                     folderName: folder,
                     folderDate: details.date,
-                    size: Int64(values.fileSize ?? 0)
+                    size: Int64(values.fileSize ?? 0),
+                    urlSchemes: metadata.urlSchemes,
+                    minimumOSVersion: metadata.minimumOSVersion
                 ))
             } catch {
                 issues.append(ScanIssue(path: url.lastPathComponent, message: error.localizedDescription))
@@ -275,6 +278,8 @@ private enum IPAMetadataReader {
         let version: String
         let build: String
         let platforms: [String]
+        let urlSchemes: [String]
+        let minimumOSVersion: String?
     }
 
     static func read(_ ipaURL: URL) throws -> Metadata {
@@ -303,7 +308,10 @@ private enum IPAMetadataReader {
             bundleIdentifier: bundle,
             version: info["CFBundleShortVersionString"] as? String ?? "",
             build: build,
-            platforms: info["CFBundleSupportedPlatforms"] as? [String] ?? []
+            platforms: info["CFBundleSupportedPlatforms"] as? [String] ?? [],
+            urlSchemes: (info["CFBundleURLTypes"] as? [[String: Any]] ?? [])
+                .flatMap { $0["CFBundleURLSchemes"] as? [String] ?? [] },
+            minimumOSVersion: info["MinimumOSVersion"] as? String
         )
     }
 

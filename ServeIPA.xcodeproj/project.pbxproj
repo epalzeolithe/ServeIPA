@@ -6,8 +6,28 @@
 	objectVersion = 90;
 	objects = {
 
+/* Begin PBXContainerItemProxy section */
+		AA1FAC8F3099AA660021E2D0 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 000000000000000000000000 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = AA1FAC813099AA650021E2D0;
+			remoteInfo = ServeIPAClient;
+		};
+		AA1FAC993099AA660021E2D0 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 000000000000000000000000 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = AA1FAC813099AA650021E2D0;
+			remoteInfo = ServeIPAClient;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		000000000000000000000120 /* ServeIPA.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ServeIPA.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AA1FAC823099AA650021E2D0 /* ServeIPAClient.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ServeIPAClient.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AA1FAC8E3099AA660021E2D0 /* ServeIPAClientTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ServeIPAClientTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		AA1FAC983099AA660021E2D0 /* ServeIPAClientUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ServeIPAClientUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -29,10 +49,40 @@
 			path = ServeIPA;
 			sourceTree = "<group>";
 		};
+		AA1FAC833099AA650021E2D0 /* ServeIPAClient */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = ServeIPAClient;
+			sourceTree = "<group>";
+		};
+		AA1FAC913099AA660021E2D0 /* ServeIPAClientTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = ServeIPAClientTests;
+			sourceTree = "<group>";
+		};
+		AA1FAC9B3099AA660021E2D0 /* ServeIPAClientUITests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = ServeIPAClientUITests;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		000000000000000130000000 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			files = (
+			);
+		};
+		AA1FAC7F3099AA650021E2D0 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			files = (
+			);
+		};
+		AA1FAC8B3099AA660021E2D0 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			files = (
+			);
+		};
+		AA1FAC953099AA660021E2D0 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
 			);
@@ -44,6 +94,9 @@
 			isa = PBXGroup;
 			children = (
 				000000000000000000000010 /* ServeIPA */,
+				AA1FAC833099AA650021E2D0 /* ServeIPAClient */,
+				AA1FAC913099AA660021E2D0 /* ServeIPAClientTests */,
+				AA1FAC9B3099AA660021E2D0 /* ServeIPAClientUITests */,
 				000000000000000000000020 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -52,6 +105,9 @@
 			isa = PBXGroup;
 			children = (
 				000000000000000000000120 /* ServeIPA.app */,
+				AA1FAC823099AA650021E2D0 /* ServeIPAClient.app */,
+				AA1FAC8E3099AA660021E2D0 /* ServeIPAClientTests.xctest */,
+				AA1FAC983099AA660021E2D0 /* ServeIPAClientUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -77,6 +133,66 @@
 			productReference = 000000000000000000000120 /* ServeIPA.app */;
 			productType = "com.apple.product-type.application";
 		};
+		AA1FAC813099AA650021E2D0 /* ServeIPAClient */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AA1FACA43099AA660021E2D0 /* Build configuration list for PBXNativeTarget "ServeIPAClient" */;
+			buildPhases = (
+				AA1FAC7E3099AA650021E2D0 /* Sources */,
+				AA1FAC7F3099AA650021E2D0 /* Frameworks */,
+				AA1FAC803099AA650021E2D0 /* Resources */,
+			);
+			buildRules = (
+			);
+			fileSystemSynchronizedGroups = (
+				AA1FAC833099AA650021E2D0 /* ServeIPAClient */,
+			);
+			name = ServeIPAClient;
+			productName = ServeIPAClient;
+			productReference = AA1FAC823099AA650021E2D0 /* ServeIPAClient.app */;
+			productType = "com.apple.product-type.application";
+		};
+		AA1FAC8D3099AA660021E2D0 /* ServeIPAClientTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AA1FACA53099AA660021E2D0 /* Build configuration list for PBXNativeTarget "ServeIPAClientTests" */;
+			buildPhases = (
+				AA1FAC8A3099AA660021E2D0 /* Sources */,
+				AA1FAC8B3099AA660021E2D0 /* Frameworks */,
+				AA1FAC8C3099AA660021E2D0 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				AA1FAC903099AA660021E2D0 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				AA1FAC913099AA660021E2D0 /* ServeIPAClientTests */,
+			);
+			name = ServeIPAClientTests;
+			productName = ServeIPAClientTests;
+			productReference = AA1FAC8E3099AA660021E2D0 /* ServeIPAClientTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		AA1FAC973099AA660021E2D0 /* ServeIPAClientUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AA1FACA63099AA660021E2D0 /* Build configuration list for PBXNativeTarget "ServeIPAClientUITests" */;
+			buildPhases = (
+				AA1FAC943099AA660021E2D0 /* Sources */,
+				AA1FAC953099AA660021E2D0 /* Frameworks */,
+				AA1FAC963099AA660021E2D0 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				AA1FAC9A3099AA660021E2D0 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				AA1FAC9B3099AA660021E2D0 /* ServeIPAClientUITests */,
+			);
+			name = ServeIPAClientUITests;
+			productName = ServeIPAClientUITests;
+			productReference = AA1FAC983099AA660021E2D0 /* ServeIPAClientUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -84,11 +200,22 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
-				LastSwiftUpdateCheck = 2630;
+				LastSwiftUpdateCheck = 2710;
 				LastUpgradeCheck = 2700;
 				TargetAttributes = {
 					000000000000000100000000 = {
 						CreatedOnToolsVersion = 26.3;
+					};
+					AA1FAC813099AA650021E2D0 = {
+						CreatedOnToolsVersion = 27.1;
+					};
+					AA1FAC8D3099AA660021E2D0 = {
+						CreatedOnToolsVersion = 27.1;
+						TestTargetID = AA1FAC813099AA650021E2D0;
+					};
+					AA1FAC973099AA660021E2D0 = {
+						CreatedOnToolsVersion = 27.1;
+						TestTargetID = AA1FAC813099AA650021E2D0;
 					};
 				};
 			};
@@ -107,12 +234,30 @@
 			projectRoot = "";
 			targets = (
 				000000000000000100000000 /* ServeIPA */,
+				AA1FAC813099AA650021E2D0 /* ServeIPAClient */,
+				AA1FAC8D3099AA660021E2D0 /* ServeIPAClientTests */,
+				AA1FAC973099AA660021E2D0 /* ServeIPAClientUITests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		000000000000000140000000 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			files = (
+			);
+		};
+		AA1FAC803099AA650021E2D0 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			files = (
+			);
+		};
+		AA1FAC8C3099AA660021E2D0 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			files = (
+			);
+		};
+		AA1FAC963099AA660021E2D0 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			files = (
 			);
@@ -125,7 +270,35 @@
 			files = (
 			);
 		};
+		AA1FAC7E3099AA650021E2D0 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			files = (
+			);
+		};
+		AA1FAC8A3099AA660021E2D0 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			files = (
+			);
+		};
+		AA1FAC943099AA660021E2D0 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			files = (
+			);
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		AA1FAC903099AA660021E2D0 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = AA1FAC813099AA650021E2D0 /* ServeIPAClient */;
+			targetProxy = AA1FAC8F3099AA660021E2D0 /* PBXContainerItemProxy */;
+		};
+		AA1FAC9A3099AA660021E2D0 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = AA1FAC813099AA650021E2D0 /* ServeIPAClient */;
+			targetProxy = AA1FAC993099AA660021E2D0 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		000000000000000011000000 /* Debug configuration for PBXProject "ServeIPA" */ = {
@@ -266,6 +439,7 @@
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JY24347UPR;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
@@ -305,6 +479,7 @@
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JY24347UPR;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
@@ -338,6 +513,194 @@
 			};
 			name = Release;
 		};
+		AA1FAC9E3099AA660021E2D0 /* Debug configuration for PBXNativeTarget "ServeIPAClient" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JY24347UPR;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Configuration/Client-Info.plist";
+				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphonesimulator*]" = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphoneos*]" = UIStatusBarStyleDefault;
+				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
+				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = fr.drax.ServeIPAClient;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				XROS_DEPLOYMENT_TARGET = 27.0;
+			};
+			name = Debug;
+		};
+		AA1FAC9F3099AA660021E2D0 /* Release configuration for PBXNativeTarget "ServeIPAClient" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JY24347UPR;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Configuration/Client-Info.plist";
+				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphonesimulator*]" = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphoneos*]" = YES;
+				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphoneos*]" = UIStatusBarStyleDefault;
+				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
+				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = fr.drax.ServeIPAClient;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				XROS_DEPLOYMENT_TARGET = 27.0;
+			};
+			name = Release;
+		};
+		AA1FACA03099AA660021E2D0 /* Debug configuration for PBXNativeTarget "ServeIPAClientTests" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = fr.drax.ServeIPAClientTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/ServeIPAClient.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/ServeIPAClient";
+				XROS_DEPLOYMENT_TARGET = 27.0;
+			};
+			name = Debug;
+		};
+		AA1FACA13099AA660021E2D0 /* Release configuration for PBXNativeTarget "ServeIPAClientTests" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = fr.drax.ServeIPAClientTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/ServeIPAClient.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/ServeIPAClient";
+				XROS_DEPLOYMENT_TARGET = 27.0;
+			};
+			name = Release;
+		};
+		AA1FACA23099AA660021E2D0 /* Debug configuration for PBXNativeTarget "ServeIPAClientUITests" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = fr.drax.ServeIPAClientUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_TARGET_NAME = ServeIPAClient;
+				XROS_DEPLOYMENT_TARGET = 27.0;
+			};
+			name = Debug;
+		};
+		AA1FACA33099AA660021E2D0 /* Release configuration for PBXNativeTarget "ServeIPAClientUITests" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				MACOSX_DEPLOYMENT_TARGET = 27.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = fr.drax.ServeIPAClientUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,7";
+				TEST_TARGET_NAME = ServeIPAClient;
+				XROS_DEPLOYMENT_TARGET = 27.0;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -354,6 +717,30 @@
 			buildConfigurations = (
 				000000000000000111000000 /* Debug configuration for PBXNativeTarget "ServeIPA" */,
 				000000000000000112000000 /* Release configuration for PBXNativeTarget "ServeIPA" */,
+			);
+			defaultConfigurationName = Release;
+		};
+		AA1FACA43099AA660021E2D0 /* Build configuration list for PBXNativeTarget "ServeIPAClient" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AA1FAC9E3099AA660021E2D0 /* Debug configuration for PBXNativeTarget "ServeIPAClient" */,
+				AA1FAC9F3099AA660021E2D0 /* Release configuration for PBXNativeTarget "ServeIPAClient" */,
+			);
+			defaultConfigurationName = Release;
+		};
+		AA1FACA53099AA660021E2D0 /* Build configuration list for PBXNativeTarget "ServeIPAClientTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AA1FACA03099AA660021E2D0 /* Debug configuration for PBXNativeTarget "ServeIPAClientTests" */,
+				AA1FACA13099AA660021E2D0 /* Release configuration for PBXNativeTarget "ServeIPAClientTests" */,
+			);
+			defaultConfigurationName = Release;
+		};
+		AA1FACA63099AA660021E2D0 /* Build configuration list for PBXNativeTarget "ServeIPAClientUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AA1FACA23099AA660021E2D0 /* Debug configuration for PBXNativeTarget "ServeIPAClientUITests" */,
+				AA1FACA33099AA660021E2D0 /* Release configuration for PBXNativeTarget "ServeIPAClientUITests" */,
 			);
 			defaultConfigurationName = Release;
 		};
