@@ -1,0 +1,380 @@
+import Foundation
+import Network
+
+final class OTAServer: @unchecked Sendable {
+    private struct Snapshot {
+        var buildsByPath: [String: IPABuild] = [:]
+        var rootURL: URL?
+        var publicURL: URL?
+    }
+
+    private struct Transfer {
+        var sent: Int64
+        var total: Int64
+        var percent: Int
+        var status: String
+        var attempt: UUID
+    }
+
+    private let listener: NWListener
+    private let queue = DispatchQueue(label: "ServeIPA.HTTPServer", qos: .userInitiated)
+    private let lock = NSLock()
+    private var snapshot = Snapshot()
+    private var transfers: [String: Transfer] = [:]
+
+    init(port: UInt16) throws {
+        guard let networkPort = NWEndpoint.Port(rawValue: port) else {
+            throw ServerError.invalidPort
+        }
+        // Le serveur HTTP n'a pas de TLS ni d'authentification : il ne doit être
+        // joignable qu'en loopback. L'exposition externe passe par Tailscale Serve.
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: networkPort)
+        listener = try NWListener(using: parameters)
+    }
+
+    func update(builds: [IPABuild], rootURL: URL, publicURL: URL?) {
+        lock.withLock {
+            snapshot = Snapshot(
+                buildsByPath: Dictionary(uniqueKeysWithValues: builds.map { ($0.relativePath, $0) }),
+                rootURL: rootURL,
+                publicURL: publicURL
+            )
+        }
+    }
+
+    func start() throws {
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.accept(connection)
+        }
+        listener.stateUpdateHandler = { state in
+            if case .failed(let error) = state {
+                print("ServeIPA listener error: \(error)")
+            }
+        }
+        listener.start(queue: queue)
+    }
+
+    func stop() {
+        listener.cancel()
+    }
+
+    private func accept(_ connection: NWConnection) {
+        connection.start(queue: queue)
+        receiveRequest(on: connection, accumulated: Data())
+    }
+
+    private func receiveRequest(on connection: NWConnection, accumulated: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 16_384) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+            var requestData = accumulated
+            if let data {
+                requestData.append(data)
+            }
+            if requestData.range(of: Data("\r\n\r\n".utf8)) != nil {
+                self.respond(to: requestData, on: connection)
+            } else if isComplete || error != nil || requestData.count >= 65_536 {
+                connection.cancel()
+            } else {
+                self.receiveRequest(on: connection, accumulated: requestData)
+            }
+        }
+    }
+
+    private func respond(to requestData: Data, on connection: NWConnection) {
+        guard let request = String(data: requestData, encoding: .utf8),
+              let requestLine = request.components(separatedBy: "\r\n").first else {
+            send(status: "400 Bad Request", body: Data(), contentType: "text/plain", on: connection)
+            return
+        }
+
+        let components = requestLine.split(separator: " ", maxSplits: 2).map(String.init)
+        guard components.count >= 2 else {
+            send(status: "400 Bad Request", body: Data(), contentType: "text/plain", on: connection)
+            return
+        }
+
+        let method = components[0]
+        let target = components[1]
+        let targetParts = target.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
+        let encodedPath = String(targetParts.first ?? "/")
+        let query = targetParts.count > 1 ? String(targetParts[1]) : ""
+        let path = encodedPath.removingPercentEncoding ?? encodedPath
+        let current = lock.withLock { snapshot }
+
+        if path == "/" {
+            let body = Self.indexPage(builds: Array(current.buildsByPath.values), publicURL: current.publicURL)
+            send(status: "200 OK", body: body, contentType: "text/html; charset=utf-8", method: method, on: connection)
+            return
+        }
+
+        if path == "/__rescan" {
+            send(status: "204 No Content", body: Data(), contentType: "text/plain", method: method, on: connection)
+            return
+        }
+
+        if path == "/__reset" {
+            let file = Self.queryValue("file", in: query) ?? ""
+            guard let build = current.buildsByPath[file] else {
+                send(status: "404 Not Found", body: Data("Unknown IPA".utf8), contentType: "text/plain", method: method, on: connection)
+                return
+            }
+            lock.withLock {
+                transfers[file] = Transfer(
+                    sent: 0,
+                    total: build.size,
+                    percent: 0,
+                    status: String(localized: "En attente du téléchargement"),
+                    attempt: UUID()
+                )
+            }
+            send(status: "200 OK", body: Data(), contentType: "text/plain", method: method, on: connection)
+            return
+        }
+
+        if path == "/__progress" {
+            let currentTransfers = lock.withLock { transfers }
+            var object: [String: Any] = [:]
+            for (file, transfer) in currentTransfers {
+                object[file] = [
+                    "sent": transfer.sent,
+                    "total": transfer.total,
+                    "percent": transfer.percent,
+                    "status": transfer.status
+                ]
+            }
+            let body = (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
+            send(status: "200 OK", body: body, contentType: "application/json", method: method, on: connection)
+            return
+        }
+
+        if path.hasPrefix("/manifest/") {
+            let buildPath = String(path.dropFirst("/manifest/".count))
+            guard let build = current.buildsByPath[buildPath],
+                  let publicURL = current.publicURL,
+                  let manifest = Self.manifest(for: build, publicURL: publicURL) else {
+                send(status: "404 Not Found", body: Data("Not found".utf8), contentType: "text/plain", method: method, on: connection)
+                return
+            }
+            send(status: "200 OK", body: manifest, contentType: "application/xml", method: method, on: connection)
+            return
+        }
+
+        let requestedBuildPath = String(path.dropFirst())
+        guard let build = current.buildsByPath[requestedBuildPath] else {
+            send(status: "404 Not Found", body: Data("Not found".utf8), contentType: "text/plain", method: method, on: connection)
+            return
+        }
+        sendFile(build.fileURL, key: requestedBuildPath, method: method, on: connection)
+    }
+
+    private static func queryValue(_ name: String, in query: String) -> String? {
+        for pair in query.split(separator: "&") {
+            let keyValue = pair.split(separator: "=", maxSplits: 1)
+            guard keyValue.count == 2, keyValue[0] == name else { continue }
+            return String(keyValue[1]).removingPercentEncoding
+        }
+        return nil
+    }
+
+    private func send(
+        status: String,
+        body: Data,
+        contentType: String,
+        method: String = "GET",
+        on connection: NWConnection
+    ) {
+        let header = """
+        HTTP/1.1 \(status)\r
+        Content-Type: \(contentType)\r
+        Content-Length: \(body.count)\r
+        Cache-Control: no-store\r
+        Connection: close\r
+        \r
+
+        """
+        var response = Data(header.utf8)
+        if method != "HEAD" {
+            response.append(body)
+        }
+        connection.send(content: response, completion: .contentProcessed { _ in
+            connection.cancel()
+        })
+    }
+
+    private func sendFile(_ url: URL, key: String, method: String, on connection: NWConnection) {
+        guard let handle = try? FileHandle(forReadingFrom: url),
+              let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber else {
+            send(status: "404 Not Found", body: Data(), contentType: "text/plain", method: method, on: connection)
+            return
+        }
+        let total = size.int64Value
+
+        let attempt: UUID = lock.withLock {
+            let existing = transfers[key]?.attempt ?? UUID()
+            transfers[key] = Transfer(
+                sent: 0,
+                total: total,
+                percent: 0,
+                status: String(localized: "Téléchargement en cours"),
+                attempt: existing
+            )
+            return existing
+        }
+
+        let header = """
+        HTTP/1.1 200 OK\r
+        Content-Type: application/octet-stream\r
+        Content-Length: \(total)\r
+        Cache-Control: no-store\r
+        Connection: close\r
+        \r
+
+        """
+        connection.send(content: Data(header.utf8), completion: .contentProcessed { [weak self] error in
+            guard error == nil, method != "HEAD" else {
+                try? handle.close()
+                connection.cancel()
+                return
+            }
+            self?.sendNextChunk(from: handle, key: key, attempt: attempt, sent: 0, total: total, on: connection)
+        })
+    }
+
+    private func sendNextChunk(
+        from handle: FileHandle,
+        key: String,
+        attempt: UUID,
+        sent: Int64,
+        total: Int64,
+        on connection: NWConnection
+    ) {
+        do {
+            let chunk = try handle.read(upToCount: 65_536) ?? Data()
+            guard !chunk.isEmpty else {
+                try handle.close()
+                lock.withLock {
+                    if transfers[key]?.attempt == attempt {
+                        transfers[key]?.status = String(localized: "Transfert HTTP terminé (installation non confirmée)")
+                    }
+                }
+                connection.cancel()
+                return
+            }
+            let newSent = sent + Int64(chunk.count)
+            let percent = total > 0 ? Int(newSent * 100 / total) : 100
+            lock.withLock {
+                if transfers[key]?.attempt == attempt {
+                    transfers[key]?.sent = newSent
+                    transfers[key]?.percent = percent
+                }
+            }
+            connection.send(content: chunk, completion: .contentProcessed { [weak self] error in
+                if error == nil {
+                    self?.sendNextChunk(from: handle, key: key, attempt: attempt, sent: newSent, total: total, on: connection)
+                } else {
+                    try? handle.close()
+                    self?.lock.withLock {
+                        if self?.transfers[key]?.attempt == attempt {
+                            self?.transfers[key]?.status = String(localized: "Connexion interrompue")
+                        }
+                    }
+                    connection.cancel()
+                }
+            })
+        } catch {
+            try? handle.close()
+            connection.cancel()
+        }
+    }
+
+    private static func manifest(for build: IPABuild, publicURL: URL) -> Data? {
+        let ipaURL = publicURL.appending(path: build.relativePath).absoluteString
+        let object: [String: Any] = [
+            "items": [[
+                "assets": [["kind": "software-package", "url": ipaURL]],
+                "metadata": [
+                    "bundle-identifier": build.bundleIdentifier,
+                    "bundle-version": build.build,
+                    "kind": "software",
+                    "title": build.name
+                ]
+            ]]
+        ]
+        return try? PropertyListSerialization.data(fromPropertyList: object, format: .xml, options: 0)
+    }
+
+    private static func indexPage(builds: [IPABuild], publicURL: URL?) -> Data {
+        let cards = builds.sorted {
+            ($0.folderDate ?? $0.folderName, $0.name) > ($1.folderDate ?? $1.folderName, $1.name)
+        }.map { build in
+            let manifestPath = "manifest/" + build.relativePath
+            let manifestURL = publicURL?.appending(path: manifestPath).absoluteString ?? ""
+            let installURL = "itms-services://?action=download-manifest&url=" + urlEncode(manifestURL)
+            let version = build.version.isEmpty ? "—" : escape(build.version)
+            let filePath = escape(build.relativePath)
+            return """
+            <article class="card" data-file="\(filePath)"><h2>\(escape(build.displayName))</h2>
+            <div class="date">\(escape(build.folderDate ?? build.folderName))</div>
+            <p>\(escape(build.name)) · \(escape(build.bundleIdentifier))</p>
+            <p>Version \(version) · Build \(escape(build.build)) · \(String(format: "%.1f", Double(build.size) / 1_048_576)) Mo</p>
+            <a class="install" href="\(escape(installURL))" onclick="return install(event,this)">Installer sur cet appareil</a>
+            <progress max="100" value="0"></progress><div class="state">En attente</div>
+            </article>
+            """
+        }.joined()
+
+        let empty = cards.isEmpty ? "<p>Aucun IPA trouvé dans les sous-dossiers.</p>" : ""
+        let html = """
+        <!doctype html><html lang="fr"><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1"><title>ServeIPA</title>
+        <style>
+        *{box-sizing:border-box}body{margin:0;background:#f5f5f7;color:#1d1d1f;font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:20px}
+        main{max-width:720px;margin:auto}.card{background:white;border-radius:17px;padding:22px;margin:16px 0;box-shadow:0 2px 14px #0000000a}
+        h1{font-size:29px}h2{margin:0 0 6px}.date{color:#007aff;font-weight:600}p,.state{color:#666;font-size:14px}
+        .install{display:block;background:#007aff;color:white;text-decoration:none;text-align:center;border-radius:11px;padding:15px;margin:18px 0;font-weight:600}
+        progress{width:100%;height:18px}.state{margin-top:8px}
+        </style></head><body><main><h1>ServeIPA</h1><p>Choisissez une version à installer sur cet iPhone ou iPad.</p>\(empty)\(cards)</main>
+        <script>
+        async function install(event,link){
+         event.preventDefault();const card=link.closest('.card'),file=card.dataset.file;
+         card.querySelector('progress').value=0;
+         card.querySelector('.state').textContent='Nouvelle tentative : attente du téléchargement (0 %)';
+         try{const r=await fetch('/__reset?file='+encodeURIComponent(file),{method:'POST',cache:'no-store'});
+         if(!r.ok)throw Error('HTTP '+r.status);window.location.href=link.href;
+         }catch(e){card.querySelector('.state').textContent='Erreur : '+e.message;}
+         return false;
+        }
+        async function update(){try{const r=await fetch('/__progress',{cache:'no-store'});if(!r.ok)return;
+         const data=await r.json();document.querySelectorAll('.card').forEach(card=>{
+         const t=data[card.dataset.file];if(!t)return;
+         card.querySelector('progress').value=t.percent;
+         card.querySelector('.state').textContent=t.status+' — '+t.percent+' % ('+(t.sent/1048576).toFixed(1)+' / '+(t.total/1048576).toFixed(1)+' Mo)';
+         });}catch(e){}}
+        update();setInterval(update,1000);
+        </script></body></html>
+        """
+        return Data(html.utf8)
+    }
+
+    private static func urlEncode(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "?&=#"))) ?? value
+    }
+
+    private static func escape(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+    }
+
+    enum ServerError: LocalizedError {
+        case invalidPort
+
+        var errorDescription: String? {
+            String(localized: "Port serveur invalide.")
+        }
+    }
+}
