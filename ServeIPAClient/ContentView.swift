@@ -5,6 +5,7 @@ struct ContentView: View {
     @State private var searchText = ""
     @State private var showsSettings = false
     @State private var appToInstall: RemoteApp?
+    @State private var appToDelete: RemoteApp?
     @Environment(\.scenePhase) private var scenePhase
 
     private var filteredApps: [RemoteApp] {
@@ -66,19 +67,33 @@ struct ContentView: View {
                         }
                     }
                 }
-                Section("Applications · \(filteredApps.count)") {
+                Section {
                     ForEach(filteredApps) { app in
                         AppRow(app: app, downloading: store.downloadingAppID == app.id,
                                downloadDisabled: store.downloadingAppID != nil,
                                install: { appToInstall = app },
                                download: { store.download(app) },
-                               open: { Task { await store.openApp(app) } })
+                               open: { Task { await store.openApp(app) } },
+                               delete: { appToDelete = app })
+                            .swipeActions(edge: .trailing) {
+                                Button("Supprimer", systemImage: "trash", role: .destructive) {
+                                    appToDelete = app
+                                }
+                            }
                     }
                     if filteredApps.isEmpty && store.isConnected {
                         ContentUnavailableView(searchText.isEmpty ? "Aucun IPA disponible" : "Aucun résultat",
                                                systemImage: "shippingbox",
                                                description: Text("Ajoutez des IPA dans les sous-dossiers du dossier choisi sur le Mac."))
                     }
+                } header: {
+                    Text("Applications · \(filteredApps.count)")
+                } footer: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Client \(AppBuildInfo.current.summary)")
+                        if let server = store.serverInfo { Text("Serveur \(server.summary)") }
+                    }
+                    .font(.caption2.monospacedDigit())
                 }
             }
             .navigationTitle("ServeIPA")
@@ -100,6 +115,16 @@ struct ContentView: View {
             } message: { app in
                 Text("Version \(app.version), build \(app.build). iOS demandera confirmation. L’IPA doit être signé pour cet appareil.")
             }
+            .confirmationDialog("Supprimer cet IPA du serveur ?", isPresented: Binding(
+                get: { appToDelete != nil }, set: { if !$0 { appToDelete = nil } }
+            ), titleVisibility: .visible, presenting: appToDelete) { app in
+                Button("Supprimer \(app.name) \(app.version) (\(app.build))", role: .destructive) {
+                    appToDelete = nil
+                    Task { await store.delete(app) }
+                }
+            } message: { app in
+                Text("Le dossier « \(app.displayName) » et son contenu seront supprimés du Mac. Cette action est définitive.")
+            }
             .alert("ServeIPA", isPresented: Binding(
                 get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } }
             )) {
@@ -119,43 +144,69 @@ private struct AppRow: View {
     let install: () -> Void
     let download: () -> Void
     let open: () -> Void
+    let delete: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Label(app.name, systemImage: "app.badge")
-                .font(.headline)
-            Text(app.displayName).font(.subheadline)
-            Text("\(app.version) · Build \(app.build) · \(ByteCountFormatter.string(fromByteCount: app.size, countStyle: .file))")
-                .font(.caption).foregroundStyle(.secondary)
-            if let date = app.date { Text(date).font(.caption).foregroundStyle(.secondary) }
-            if let minimum = app.minimumOSVersion {
-                Text("iOS \(minimum) minimum").font(.caption).foregroundStyle(.secondary)
-            }
-            Text(app.bundleIdentifier).font(.caption2).foregroundStyle(.secondary)
-                .textSelection(.enabled)
-            ViewThatFits(in: .horizontal) {
-                HStack {
-                    Button("Installer", systemImage: "square.and.arrow.down", action: install)
-                        .buttonStyle(.borderedProminent)
-                    actions
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(app.name).font(.headline).lineLimit(1)
+                    Text("\(app.version) (\(app.build))")
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .layoutPriority(1)
                 }
-                VStack(alignment: .leading) {
-                    Button("Installer", systemImage: "square.and.arrow.down", action: install)
-                        .buttonStyle(.borderedProminent)
-                    actions
-                }
+                Text(details)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
+            Spacer(minLength: 0)
+            Menu {
+                Section(app.bundleIdentifier) {
+                    Button(downloading ? "Téléchargement…" : "Télécharger le fichier IPA",
+                           systemImage: "arrow.down.doc", action: download)
+                        .disabled(downloadDisabled)
+                    if app.launchURL != nil {
+                        Button("Ouvrir l’app", systemImage: "arrow.up.forward.app", action: open)
+                    }
+                }
+                Button("Supprimer du serveur", systemImage: "trash", role: .destructive, action: delete)
+            } label: {
+                Label("Options", systemImage: "ellipsis.circle")
+                    .labelStyle(.iconOnly)
+                    .imageScale(.large)
+            }
+            .buttonStyle(.borderless)
+            Button("Installer", systemImage: "square.and.arrow.down", action: install)
+                .labelStyle(.iconOnly)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
         }
-        .padding(.vertical, 6)
+        .padding(.vertical, 1)
     }
 
-    private var actions: some View {
-        Menu("Options", systemImage: "ellipsis.circle") {
-            Button(downloading ? "Téléchargement…" : "Télécharger le fichier IPA", action: download)
-                .disabled(downloadDisabled)
-            if app.launchURL != nil { Button("Ouvrir l’app", action: open) }
-        }
-        .buttonStyle(.bordered)
+    /// Date · taille · iOS minimum · nom du dossier s’il diffère du nom de l’app.
+    private var details: String {
+        var parts: [String] = []
+        if let date = app.date { parts.append(Self.shortDate(date)) }
+        parts.append(ByteCountFormatter.string(fromByteCount: app.size, countStyle: .file))
+        if let minimum = app.minimumOSVersion { parts.append("iOS \(minimum)+") }
+        if app.displayName != app.name { parts.append(app.displayName) }
+        return parts.joined(separator: " · ")
+    }
+
+    private static let inputFormat: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return formatter
+    }()
+
+    private static func shortDate(_ text: String) -> String {
+        guard let date = inputFormat.date(from: text) else { return text }
+        return date.formatted(.dateTime.day(.twoDigits).month(.twoDigits).year(.twoDigits).hour().minute())
     }
 }
 
@@ -181,6 +232,10 @@ private struct ClientSettings: View {
                     Toggle("Ouvrir automatiquement si détectable", isOn: $store.autoOpen)
                     Text("Fonctionne au premier plan pour une nouvelle app dont le schéma d’URL est déclaré dans ce client. Une app déjà présente ou sans schéma détectable doit être ouverte manuellement. La version installée n’est pas vérifiable.")
                         .font(.caption).foregroundStyle(.secondary)
+                }
+                Section("À propos") {
+                    LabeledContent("Client", value: AppBuildInfo.current.summary)
+                    LabeledContent("Serveur", value: store.serverInfo?.summary ?? "Non communiqué")
                 }
             }
             .navigationTitle("Réglages")

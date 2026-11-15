@@ -26,6 +26,9 @@ final class OTAServer: @unchecked Sendable {
 
     private var sessions: [String: InstallSession] = [:]
 
+    /// Supprime un IPA à la demande d'un client (`DELETE /api/v1/apps?app=…`). Défini avant `start()`.
+    var deleteHandler: (@Sendable (IPABuild) async throws -> Void)?
+
     private let listener: NWListener
     private let queue = DispatchQueue(label: "ServeIPA.HTTPServer", qos: .userInitiated)
     private let lock = NSLock()
@@ -192,7 +195,13 @@ final class OTAServer: @unchecked Sendable {
     // A random session follows the manifest into the IPA URL, isolating concurrent devices.
     private func respondToAPI(path: String, query: String, method: String, current: Snapshot, on connection: NWConnection) {
         if path == "/api/v1/health", method == "GET" {
-            sendJSON(["service": "ServeIPA", "apiVersion": 1], on: connection)
+            let info = AppBuildInfo.current
+            var health: [String: Any] = [
+                "service": "ServeIPA", "apiVersion": 1,
+                "serverVersion": info.version, "serverBuild": info.build
+            ]
+            health["serverBuildDate"] = AppBuildInfo.rawDate
+            sendJSON(health, on: connection)
             return
         }
         if path == "/api/v1/apps", method == "GET" {
@@ -210,6 +219,27 @@ final class OTAServer: @unchecked Sendable {
                 return object
             }
             sendJSON(["apiVersion": 1, "apps": apps], on: connection)
+            return
+        }
+        if path == "/api/v1/apps", method == "DELETE" {
+            guard let buildID = Self.queryValue("app", in: query),
+                  let build = current.buildsByPath[buildID] else {
+                sendJSON(["error": "App unavailable"], status: "404 Not Found", on: connection)
+                return
+            }
+            guard let deleteHandler else {
+                sendJSON(["error": "Deletion unavailable"], status: "503 Service Unavailable", on: connection)
+                return
+            }
+            Task {
+                do {
+                    try await deleteHandler(build)
+                    self.lock.withLock { self.snapshot.buildsByPath[buildID] = nil }
+                    self.send(status: "204 No Content", body: Data(), contentType: "text/plain", on: connection)
+                } catch {
+                    self.sendJSON(["error": error.localizedDescription], status: "500 Internal Server Error", on: connection)
+                }
+            }
             return
         }
         if path == "/api/v1/sessions", method == "POST" {

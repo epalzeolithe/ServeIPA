@@ -98,20 +98,35 @@ final class IPAStore {
     }
 
     func delete(_ build: IPABuild) {
-        guard let folderURL else { return }
+        do {
+            try removeBuildDirectory(build)
+        } catch {
+            serverState = .failed(error.localizedDescription)
+        }
+    }
+
+    /// Supprime le dossier d'export de l'IPA (sous-dossier direct ou non du dossier choisi, jamais la racine).
+    /// Utilisé par l'app Mac et par l'API (`DELETE /api/v1/apps`).
+    func removeBuildDirectory(_ build: IPABuild) throws {
+        guard let folderURL else { throw DeleteError.unsafeDirectory }
         let rootURL = folderURL.standardizedFileURL
         let buildDirectoryURL = build.fileURL.deletingLastPathComponent().standardizedFileURL
         guard buildDirectoryURL != rootURL,
               buildDirectoryURL.pathComponents.starts(with: rootURL.pathComponents) else {
-            serverState = .failed(String(localized: "Le répertoire de cet IPA ne peut pas être supprimé en toute sécurité."))
-            return
+            throw DeleteError.unsafeDirectory
         }
 
-        do {
-            try FileManager.default.removeItem(at: buildDirectoryURL)
-            Task { await refresh() }
-        } catch {
-            serverState = .failed(error.localizedDescription)
+        try FileManager.default.removeItem(at: buildDirectoryURL)
+        builds.removeAll { $0.fileURL.deletingLastPathComponent().standardizedFileURL == buildDirectoryURL }
+        server?.update(builds: builds, rootURL: folderURL, publicURL: serverURL)
+        Task { await refresh() }
+    }
+
+    enum DeleteError: LocalizedError {
+        case unsafeDirectory
+
+        var errorDescription: String? {
+            String(localized: "Le répertoire de cet IPA ne peut pas être supprimé en toute sécurité.")
         }
     }
 
@@ -127,6 +142,12 @@ final class IPAStore {
             let publicURL = try await Tailscale.publicURL()
             let newServer = try OTAServer(port: port)
             newServer.update(builds: builds, rootURL: folderURL, publicURL: publicURL)
+            newServer.deleteHandler = { [weak self] build in
+                try await MainActor.run {
+                    guard let self else { throw DeleteError.unsafeDirectory }
+                    try self.removeBuildDirectory(build)
+                }
+            }
             server = newServer
             try newServer.start()
             try await Tailscale.serve(port: port)

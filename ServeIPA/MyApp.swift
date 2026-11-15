@@ -84,6 +84,8 @@ private struct ServerMenu: View {
 
         Divider()
 
+        Text("ServeIPA \(AppBuildInfo.current.summary)")
+
         Button("Quitter ServeIPA") {
             NSApplication.shared.terminate(nil)
         }

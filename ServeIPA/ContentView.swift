@@ -145,7 +145,7 @@ private struct BuildList: View {
             }
             .safeAreaInset(edge: .bottom) {
                 HStack {
-                    Text("\(builds.count) IPA")
+                    Text("\(builds.count) IPA · ServeIPA \(AppBuildInfo.current.summary)")
                         .foregroundStyle(.secondary)
                     Spacer()
                     if let selected = builds.first(where: { $0.id == selection }) {
@@ -230,9 +230,13 @@ struct ServeIPASettingsView: View {
                 )
                 Toggle("Démarrer automatiquement le serveur", isOn: $store.startServerAutomatically)
             }
+            Section("À propos") {
+                LabeledContent("ServeIPA", value: AppBuildInfo.current.summary)
+                    .textSelection(.enabled)
+            }
         }
         .formStyle(.grouped)
-        .frame(width: 520, height: 260)
+        .frame(width: 520, height: 330)
         .padding()
     }
 }

@@ -10,6 +10,8 @@ final class ClientStore {
         didSet { UserDefaults.standard.set(autoOpen, forKey: "autoOpen") }
     }
     var apps: [RemoteApp] = []
+    /// Version et build du serveur Mac (nil si le serveur ne les publie pas encore).
+    var serverInfo: AppBuildInfo?
     var connectionMessage = "Connexion au serveur…"
     var isConnected = false
     var isLoading = false
@@ -64,16 +66,26 @@ final class ClientStore {
         do {
             let base = try ServerAddress.parse(requestedAddress)
             let data = try await request(base.appending(path: "api/v1/health"))
-            struct Health: Decodable { let service: String; let apiVersion: Int }
+            struct Health: Decodable {
+                let service: String
+                let apiVersion: Int
+                let serverVersion: String?
+                let serverBuild: String?
+                let serverBuildDate: String?
+            }
             guard let health = try? JSONDecoder().decode(Health.self, from: data),
                   health.service == "ServeIPA", health.apiVersion == 1 else {
                 throw ClientError.incompatibleServer
+            }
+            let info = health.serverBuild.map {
+                AppBuildInfo(version: health.serverVersion ?? "—", build: $0, rawDate: health.serverBuildDate)
             }
             let catalogData = try await request(base.appending(path: "api/v1/apps"))
             let catalog = try JSONDecoder().decode(AppCatalog.self, from: catalogData)
             guard catalog.apiVersion == 1 else { throw ClientError.incompatibleServer }
             guard address == requestedAddress else { return }
             apps = catalog.apps
+            serverInfo = info
             isConnected = true
             connectionMessage = base.host?.hasSuffix(".ts.net") == true
                 ? "Serveur Tailscale accessible" : "Serveur accessible"
@@ -81,6 +93,7 @@ final class ClientStore {
             guard address == requestedAddress else { return }
             isConnected = false
             apps = []
+            serverInfo = nil
             if case ClientError.http(404) = error {
                 connectionMessage = ClientError.incompatibleServer.localizedDescription
             } else {
@@ -202,6 +215,24 @@ final class ClientStore {
                     errorMessage = error.localizedDescription
                 }
             }
+        }
+    }
+
+    /// Supprime l'IPA du serveur (son dossier d'export sur le Mac), puis recharge la liste.
+    func delete(_ app: RemoteApp) async {
+        do {
+            let base = try ServerAddress.parse(address)
+            var components = URLComponents(url: base.appending(path: "api/v1/apps"), resolvingAgainstBaseURL: false)
+            components?.queryItems = [URLQueryItem(name: "app", value: app.id)]
+            guard let url = components?.url else { throw ClientError.invalidAddress }
+            _ = try await request(url, method: "DELETE")
+            apps.removeAll { $0.id == app.id }
+            await refresh()
+        } catch ClientError.http(let code) where code == 404 || code == 405 {
+            errorMessage = "Suppression impossible (HTTP \(code)) : l’IPA n’existe plus, ou ServeIPA doit être mis à jour sur le Mac."
+            await refresh()
+        } catch {
+            errorMessage = "Suppression impossible : \(error.localizedDescription)"
         }
     }
 
