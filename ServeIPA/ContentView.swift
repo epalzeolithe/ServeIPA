@@ -230,13 +230,22 @@ struct ServeIPASettingsView: View {
                 )
                 Toggle("Démarrer automatiquement le serveur", isOn: $store.startServerAutomatically)
             }
+            Section("Nettoyage") {
+                Picker("Builds conservés par app", selection: $store.keepBuildsPerApp) {
+                    Text("Tous").tag(0)
+                    ForEach([1, 2, 3, 5, 10], id: \.self) { Text("\($0)").tag($0) }
+                }
+                Text("Les dossiers d’export plus anciens sont supprimés définitivement du disque à chaque actualisation.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("À propos") {
                 LabeledContent("ServeIPA", value: AppBuildInfo.current.summary)
                     .textSelection(.enabled)
             }
         }
         .formStyle(.grouped)
-        .frame(width: 520, height: 330)
+        .frame(width: 520, height: 440)
         .padding()
     }
 }

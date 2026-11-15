@@ -14,6 +14,8 @@ struct IPABuild: Identifiable, Equatable, Sendable {
     let size: Int64
     var urlSchemes: [String] = []
     var minimumOSVersion: String? = nil
+    /// Chemin de l'icône PNG dans l'archive IPA (nil si l'icône n'existe que dans Assets.car).
+    var iconEntry: String? = nil
 
     var displayName: String {
         Self.folderDetails(folderName).name

@@ -16,6 +16,35 @@ struct ContentView: View {
         }
     }
 
+    private var groups: [AppGroup] { AppGroup.grouping(filteredApps) }
+
+    @State private var expandedGroups: Set<String> = []
+
+    private func expansionBinding(for id: String) -> Binding<Bool> {
+        Binding(
+            get: { expandedGroups.contains(id) || !searchText.isEmpty },
+            set: { if $0 { expandedGroups.insert(id) } else { expandedGroups.remove(id) } }
+        )
+    }
+
+    private func row(for app: RemoteApp, isLatest: Bool, olderCount: Int = 0) -> some View {
+        let record = store.installHistory[app.bundleIdentifier]
+        return AppRow(app: app,
+                      iconURL: isLatest ? store.iconURL(for: app) : nil,
+                      isLatest: isLatest,
+                      olderCount: olderCount,
+                      lastInstall: record,
+                      downloading: store.downloadingAppID == app.id,
+                      downloadDisabled: store.downloadingAppID != nil,
+                      install: { appToInstall = app },
+                      download: { store.download(app) },
+                      open: { Task { await store.openApp(app) } },
+                      delete: { appToDelete = app })
+            .swipeActions(edge: .trailing) {
+                Button("Supprimer", systemImage: "trash", role: .destructive) { appToDelete = app }
+            }
+    }
+
     var body: some View {
         NavigationStack {
             List {
@@ -68,26 +97,24 @@ struct ContentView: View {
                     }
                 }
                 Section {
-                    ForEach(filteredApps) { app in
-                        AppRow(app: app, downloading: store.downloadingAppID == app.id,
-                               downloadDisabled: store.downloadingAppID != nil,
-                               install: { appToInstall = app },
-                               download: { store.download(app) },
-                               open: { Task { await store.openApp(app) } },
-                               delete: { appToDelete = app })
-                            .swipeActions(edge: .trailing) {
-                                Button("Supprimer", systemImage: "trash", role: .destructive) {
-                                    appToDelete = app
-                                }
+                    ForEach(groups) { group in
+                        if group.older.isEmpty {
+                            row(for: group.latest, isLatest: true)
+                        } else {
+                            DisclosureGroup(isExpanded: expansionBinding(for: group.id)) {
+                                ForEach(group.older) { app in row(for: app, isLatest: false) }
+                            } label: {
+                                row(for: group.latest, isLatest: true, olderCount: group.older.count)
                             }
+                        }
                     }
-                    if filteredApps.isEmpty && store.isConnected {
+                    if groups.isEmpty && store.isConnected {
                         ContentUnavailableView(searchText.isEmpty ? "Aucun IPA disponible" : "Aucun résultat",
                                                systemImage: "shippingbox",
                                                description: Text("Ajoutez des IPA dans les sous-dossiers du dossier choisi sur le Mac."))
                     }
                 } header: {
-                    Text("Applications · \(filteredApps.count)")
+                    Text("Applications · \(groups.count) · \(filteredApps.count) builds")
                 } footer: {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Client \(AppBuildInfo.current.summary)")
@@ -139,6 +166,13 @@ struct ContentView: View {
 
 private struct AppRow: View {
     let app: RemoteApp
+    /// Icône du build ; nil pour les builds précédents d'un groupe (affichés sans icône).
+    let iconURL: URL?
+    /// Build le plus récent de son app (ligne principale du groupe).
+    let isLatest: Bool
+    let olderCount: Int
+    /// Dernière installation de cette app lancée depuis ce client.
+    let lastInstall: InstallRecord?
     let downloading: Bool
     let downloadDisabled: Bool
     let install: () -> Void
@@ -146,16 +180,38 @@ private struct AppRow: View {
     let open: () -> Void
     let delete: () -> Void
 
+    private var isLastInstalled: Bool { lastInstall?.appID == app.id }
+    private var isNewer: Bool { isLatest && lastInstall?.isOlder(than: app) == true }
+
     var body: some View {
         HStack(spacing: 10) {
+            if isLatest {
+                AppIconView(url: iconURL)
+            } else {
+                Color.clear.frame(width: 36, height: 1)
+            }
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(app.name).font(.headline).lineLimit(1)
+                    if isLatest { Text(app.name).font(.headline).lineLimit(1) }
                     Text("\(app.version) (\(app.build))")
                         .font(.subheadline.monospacedDigit())
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .layoutPriority(1)
+                    if isLastInstalled {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                            .accessibilityLabel("Dernière installation via ServeIPA")
+                    }
+                    if isNewer {
+                        Text("Nouveau")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(.tint, in: .capsule)
+                            .foregroundStyle(.white)
+                            .accessibilityLabel("Plus récent que la dernière installation")
+                    }
                 }
                 Text(details)
                     .font(.caption.monospacedDigit())
@@ -193,6 +249,8 @@ private struct AppRow: View {
         if let date = app.date { parts.append(Self.shortDate(date)) }
         parts.append(ByteCountFormatter.string(fromByteCount: app.size, countStyle: .file))
         if let minimum = app.minimumOSVersion { parts.append("iOS \(minimum)+") }
+        if isNewer, let lastInstall { parts.append("installé : \(lastInstall.build)") }
+        if olderCount > 0 { parts.append(olderCount == 1 ? "1 ancien" : "\(olderCount) anciens") }
         if app.displayName != app.name { parts.append(app.displayName) }
         return parts.joined(separator: " · ")
     }
@@ -207,6 +265,42 @@ private struct AppRow: View {
     private static func shortDate(_ text: String) -> String {
         guard let date = inputFormat.date(from: text) else { return text }
         return date.formatted(.dateTime.day(.twoDigits).month(.twoDigits).year(.twoDigits).hour().minute())
+    }
+}
+
+/// Icône d'app chargée depuis le serveur, gardée en mémoire pour la session.
+private struct AppIconView: View {
+    let url: URL?
+    @State private var image: UIImage?
+
+    private static let cache = NSCache<NSURL, UIImage>()
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image).resizable().scaledToFill()
+            } else {
+                Image(systemName: "app.dashed")
+                    .resizable().scaledToFit()
+                    .padding(6)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .frame(width: 36, height: 36)
+        .clipShape(.rect(cornerRadius: 8, style: .continuous))
+        .accessibilityHidden(true)
+        .task(id: url) { await load() }
+    }
+
+    private func load() async {
+        guard let url else { image = nil; return }
+        if let cached = Self.cache.object(forKey: url as NSURL) { image = cached; return }
+        guard let (data, response) = try? await URLSession.shared.data(from: url),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              response.url?.scheme == "https",
+              let loaded = UIImage(data: data) else { return }
+        Self.cache.setObject(loaded, forKey: url as NSURL)
+        image = loaded
     }
 }
 

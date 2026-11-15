@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import ImageIO
 import Observation
 import ServiceManagement
 
@@ -34,6 +35,7 @@ final class IPAStore {
     private enum DefaultsKey {
         static let folderBookmark = "ipaFolderBookmark"
         static let startServerAutomatically = "startServerAutomatically"
+        static let keepBuildsPerApp = "keepBuildsPerApp"
     }
 
     var builds: [IPABuild] = []
@@ -50,6 +52,14 @@ final class IPAStore {
         }
     }
 
+    /// Nombre de builds conservés par app (identifiant de bundle). 0 = nettoyage désactivé.
+    var keepBuildsPerApp: Int {
+        didSet {
+            UserDefaults.standard.set(keepBuildsPerApp, forKey: DefaultsKey.keepBuildsPerApp)
+            Task { await refresh() }
+        }
+    }
+
     let port: UInt16 = 8765
     private var server: OTAServer?
     private var isAccessingSecurityScopedFolder = false
@@ -57,6 +67,7 @@ final class IPAStore {
     init() {
         UserDefaults.standard.register(defaults: [DefaultsKey.startServerAutomatically: true])
         startServerAutomatically = UserDefaults.standard.bool(forKey: DefaultsKey.startServerAutomatically)
+        keepBuildsPerApp = UserDefaults.standard.integer(forKey: DefaultsKey.keepBuildsPerApp)
         restoreFolder()
     }
 
@@ -84,9 +95,18 @@ final class IPAStore {
             return
         }
         isScanning = true
-        let result = await Task.detached {
+        var result = await Task.detached {
             Self.scan(folderURL)
         }.value
+        let keep = keepBuildsPerApp
+        if keep > 0 {
+            let removed = await Task.detached {
+                Self.pruneOldBuilds(result.builds, keep: keep, rootURL: folderURL)
+            }.value
+            if removed > 0 {
+                result = await Task.detached { Self.scan(folderURL) }.value
+            }
+        }
         builds = result.builds
         scanIssues = result.issues
         isScanning = false
@@ -243,6 +263,32 @@ final class IPAStore {
         }
     }
 
+    /// Supprime les dossiers d'export des builds au-delà des `keep` plus récents de chaque app.
+    /// Un dossier n'est supprimé que si aucun build conservé ne s'y trouve, et jamais la racine.
+    /// Retourne le nombre de dossiers supprimés.
+    nonisolated private static func pruneOldBuilds(_ builds: [IPABuild], keep: Int, rootURL: URL) -> Int {
+        let root = rootURL.standardizedFileURL
+        let directory = { (build: IPABuild) in build.fileURL.deletingLastPathComponent().standardizedFileURL }
+        let newestFirst = { (a: IPABuild, b: IPABuild) -> Bool in
+            let left = (a.folderDate ?? a.folderName, Int(a.build) ?? -1)
+            let right = (b.folderDate ?? b.folderName, Int(b.build) ?? -1)
+            return left > right
+        }
+        var kept: Set<URL> = []
+        var candidates: Set<URL> = []
+        for group in Dictionary(grouping: builds, by: \.bundleIdentifier).values {
+            let sorted = group.sorted(by: newestFirst)
+            sorted.prefix(keep).forEach { kept.insert(directory($0)) }
+            sorted.dropFirst(keep).forEach { candidates.insert(directory($0)) }
+        }
+        var removed = 0
+        for url in candidates.subtracting(kept)
+        where url != root && url.pathComponents.starts(with: root.pathComponents) {
+            if (try? FileManager.default.removeItem(at: url)) != nil { removed += 1 }
+        }
+        return removed
+    }
+
     nonisolated private static func scan(_ rootURL: URL) -> (builds: [IPABuild], issues: [ScanIssue]) {
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isHiddenKey, .fileSizeKey]
         guard let enumerator = FileManager.default.enumerator(
@@ -278,7 +324,8 @@ final class IPAStore {
                     folderDate: details.date,
                     size: Int64(values.fileSize ?? 0),
                     urlSchemes: metadata.urlSchemes,
-                    minimumOSVersion: metadata.minimumOSVersion
+                    minimumOSVersion: metadata.minimumOSVersion,
+                    iconEntry: metadata.iconEntry
                 ))
             } catch {
                 issues.append(ScanIssue(path: url.lastPathComponent, message: error.localizedDescription))
@@ -292,7 +339,7 @@ final class IPAStore {
     }
 }
 
-private enum IPAMetadataReader {
+enum IPAMetadataReader {
     struct Metadata {
         let name: String
         let bundleIdentifier: String
@@ -301,12 +348,14 @@ private enum IPAMetadataReader {
         let platforms: [String]
         let urlSchemes: [String]
         let minimumOSVersion: String?
+        let iconEntry: String?
     }
 
-    static func read(_ ipaURL: URL) throws -> Metadata {
+    nonisolated static func read(_ ipaURL: URL) throws -> Metadata {
         let listing = try runUnzip(arguments: ["-Z1", ipaURL.path])
+        let entries = listing.split(separator: "\n").map(String.init)
         let pattern = #"^Payload/[^/]+\.app/Info\.plist$"#
-        let candidates = listing.split(separator: "\n").map(String.init).filter {
+        let candidates = entries.filter {
             $0.range(of: pattern, options: .regularExpression) != nil
         }
         guard candidates.count == 1, let plistPath = candidates.first else {
@@ -332,11 +381,56 @@ private enum IPAMetadataReader {
             platforms: info["CFBundleSupportedPlatforms"] as? [String] ?? [],
             urlSchemes: (info["CFBundleURLTypes"] as? [[String: Any]] ?? [])
                 .flatMap { $0["CFBundleURLSchemes"] as? [String] ?? [] },
-            minimumOSVersion: info["MinimumOSVersion"] as? String
+            minimumOSVersion: info["MinimumOSVersion"] as? String,
+            iconEntry: iconEntry(entries: entries, info: info)
         )
     }
 
-    private static func runUnzip(arguments: [String]) throws -> String {
+    /// Choisit la meilleure icône PNG à la racine du bundle : d'abord les fichiers déclarés
+    /// dans CFBundleIconFiles, sinon les PNG dont le nom contient « icon ». Préfère la plus grande.
+    nonisolated private static func iconEntry(entries: [String], info: [String: Any]) -> String? {
+        let pngs = entries.filter {
+            $0.range(of: #"^Payload/[^/]+\.app/[^/]+\.png$"#, options: .regularExpression) != nil
+        }
+        var prefixes = info["CFBundleIconFiles"] as? [String] ?? []
+        for key in ["CFBundleIcons", "CFBundleIcons~ipad"] {
+            let primary = (info[key] as? [String: Any])?["CFBundlePrimaryIcon"] as? [String: Any]
+            prefixes += primary?["CFBundleIconFiles"] as? [String] ?? []
+        }
+        let fileName = { (path: String) in (path as NSString).lastPathComponent }
+        let declared = pngs.filter { path in prefixes.contains { fileName(path).hasPrefix($0) } }
+        let pool = declared.isEmpty
+            ? pngs.filter { fileName($0).localizedCaseInsensitiveContains("icon") }
+            : declared
+        func score(_ path: String) -> Int {
+            let name = fileName(path)
+            if name.contains("1024") { return 5 }
+            if name.contains("@3x") { return 4 }
+            if name.contains("@2x") { return name.contains("~ipad") ? 2 : 3 }
+            return 1
+        }
+        return pool.max { score($0) < score($1) }
+    }
+
+    /// Extrait l'icône de l'IPA et la réencode en PNG standard (les PNG iOS sont au format
+    /// optimisé « CgBI », que ImageIO sait décoder), réduite à `maxPixels`.
+    nonisolated static func iconPNG(ipaURL: URL, entry: String, maxPixels: Int = 180) -> Data? {
+        guard let raw = try? runUnzipData(arguments: ["-p", ipaURL.path, entry]),
+              let source = CGImageSourceCreateWithData(raw as CFData, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceThumbnailMaxPixelSize: maxPixels
+              ] as CFDictionary) else { return nil }
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(output, "public.png" as CFString, 1, nil) else {
+            return nil
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        return CGImageDestinationFinalize(destination) ? output as Data : nil
+    }
+
+    nonisolated private static func runUnzip(arguments: [String]) throws -> String {
         let data = try runUnzipData(arguments: arguments)
         guard let string = String(data: data, encoding: .utf8) else {
             throw CocoaError(.fileReadInapplicableStringEncoding)
@@ -344,7 +438,7 @@ private enum IPAMetadataReader {
         return string
     }
 
-    private static func runUnzipData(arguments: [String]) throws -> Data {
+    nonisolated private static func runUnzipData(arguments: [String]) throws -> Data {
         let process = Process()
         let output = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")

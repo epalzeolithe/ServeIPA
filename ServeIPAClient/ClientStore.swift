@@ -12,6 +12,12 @@ final class ClientStore {
     var apps: [RemoteApp] = []
     /// Version et build du serveur Mac (nil si le serveur ne les publie pas encore).
     var serverInfo: AppBuildInfo?
+    /// Dernière installation lancée depuis ce client, par identifiant de bundle.
+    private(set) var installHistory: [String: InstallRecord] = {
+        guard let data = UserDefaults.standard.data(forKey: "installHistory"),
+              let saved = try? JSONDecoder().decode([String: InstallRecord].self, from: data) else { return [:] }
+        return saved
+    }()
     var connectionMessage = "Connexion au serveur…"
     var isConnected = false
     var isLoading = false
@@ -127,6 +133,12 @@ final class ClientStore {
                 clearPending()
                 throw ClientError.invalidLink
             }
+            installHistory[app.bundleIdentifier] = InstallRecord(
+                appID: app.id, version: app.version, build: app.build, date: Date()
+            )
+            if let data = try? JSONEncoder().encode(installHistory) {
+                UserDefaults.standard.set(data, forKey: "installHistory")
+            }
         } catch { errorMessage = error.localizedDescription }
     }
 
@@ -216,6 +228,14 @@ final class ClientStore {
                 }
             }
         }
+    }
+
+    /// URL de l'icône du build, si le serveur en a une.
+    func iconURL(for app: RemoteApp) -> URL? {
+        guard app.hasIcon == true, let base = try? ServerAddress.parse(address) else { return nil }
+        var components = URLComponents(url: base.appending(path: "api/v1/apps/icon"), resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "app", value: app.id)]
+        return components?.url
     }
 
     /// Supprime l'IPA du serveur (son dossier d'export sur le Mac), puis recharge la liste.

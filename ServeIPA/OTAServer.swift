@@ -25,6 +25,8 @@ final class OTAServer: @unchecked Sendable {
     }
 
     private var sessions: [String: InstallSession] = [:]
+    /// Icônes PNG déjà extraites, par identifiant de build.
+    private var iconCache: [String: Data] = [:]
 
     /// Supprime un IPA à la demande d'un client (`DELETE /api/v1/apps?app=…`). Défini avant `start()`.
     var deleteHandler: (@Sendable (IPABuild) async throws -> Void)?
@@ -212,13 +214,37 @@ final class OTAServer: @unchecked Sendable {
                     "id": build.id, "name": build.name, "displayName": build.displayName,
                     "bundleIdentifier": build.bundleIdentifier, "version": build.version,
                     "build": build.build, "size": build.size, "platforms": build.platforms,
-                    "urlSchemes": build.urlSchemes
+                    "urlSchemes": build.urlSchemes,
+                    "hasIcon": build.iconEntry != nil
                 ]
                 object["date"] = build.folderDate
                 object["minimumOSVersion"] = build.minimumOSVersion
                 return object
             }
             sendJSON(["apiVersion": 1, "apps": apps], on: connection)
+            return
+        }
+        if path == "/api/v1/apps/icon", method == "GET" || method == "HEAD" {
+            guard let buildID = Self.queryValue("app", in: query),
+                  let build = current.buildsByPath[buildID],
+                  let entry = build.iconEntry else {
+                sendJSON(["error": "Icon unavailable"], status: "404 Not Found", on: connection)
+                return
+            }
+            if let cached = lock.withLock({ iconCache[buildID] }) {
+                send(status: "200 OK", body: cached, contentType: "image/png", method: method, on: connection)
+                return
+            }
+            // L'extraction lance unzip : hors de la file du serveur pour ne pas bloquer les autres requêtes.
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self else { return }
+                guard let png = IPAMetadataReader.iconPNG(ipaURL: build.fileURL, entry: entry) else {
+                    self.sendJSON(["error": "Icon unreadable"], status: "404 Not Found", on: connection)
+                    return
+                }
+                self.lock.withLock { self.iconCache[buildID] = png }
+                self.send(status: "200 OK", body: png, contentType: "image/png", method: method, on: connection)
+            }
             return
         }
         if path == "/api/v1/apps", method == "DELETE" {

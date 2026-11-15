@@ -17,6 +17,8 @@ struct RemoteApp: Codable, Identifiable, Equatable {
     let urlSchemes: [String]
     let date: String?
     let minimumOSVersion: String?
+    /// Absent sur les serveurs plus anciens.
+    let hasIcon: Bool?
 
     var launchURL: URL? {
         // Schemes used by system services or sign-in providers aren't app launch contracts.
@@ -27,6 +29,41 @@ struct RemoteApp: Codable, Identifiable, Equatable {
             $0.range(of: "^[A-Za-z][A-Za-z0-9+.-]*$", options: .regularExpression) != nil
         }) else { return nil }
         return URL(string: scheme + "://")
+    }
+}
+
+/// Tous les builds d'une même app (même identifiant de bundle), du plus récent au plus ancien.
+struct AppGroup: Identifiable {
+    let id: String
+    let builds: [RemoteApp]
+    var latest: RemoteApp { builds[0] }
+    var older: ArraySlice<RemoteApp> { builds.dropFirst() }
+
+    /// Regroupe en conservant l'ordre du serveur (déjà trié du plus récent au plus ancien).
+    static func grouping(_ apps: [RemoteApp]) -> [AppGroup] {
+        var order: [String] = []
+        var buckets: [String: [RemoteApp]] = [:]
+        for app in apps {
+            if buckets[app.bundleIdentifier] == nil { order.append(app.bundleIdentifier) }
+            buckets[app.bundleIdentifier, default: []].append(app)
+        }
+        return order.map { AppGroup(id: $0, builds: buckets[$0] ?? []) }
+    }
+}
+
+/// Dernière installation lancée depuis ce client pour une app. iOS ne permet pas de lire
+/// la version réellement installée : c'est l'historique de ServeIPA, pas une vérification.
+struct InstallRecord: Codable, Equatable {
+    let appID: String
+    let version: String
+    let build: String
+    let date: Date
+
+    /// Vrai si `build` est plus récent que le build de cet enregistrement.
+    func isOlder(than app: RemoteApp) -> Bool {
+        guard app.id != appID else { return false }
+        if let new = Int(app.build), let old = Int(build) { return new > old }
+        return app.build.compare(build, options: .numeric) == .orderedDescending
     }
 }
 
