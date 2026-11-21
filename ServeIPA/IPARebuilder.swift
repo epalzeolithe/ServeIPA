@@ -55,9 +55,7 @@ enum IPARebuilder {
         }
         let projectName = project.deletingPathExtension().lastPathComponent
         let scheme = try schemeOverride
-            ?? listSchemes(project: project).first { $0 == projectName || $0 == appName }
-            ?? listSchemes(project: project).first
-            ?? { throw RebuildError.schemeNotFound(projectName) }()
+            ?? scheme(in: project, bundleIdentifier: bundleIdentifier, appName: appName, projectName: projectName)
 
         let work = FileManager.default.temporaryDirectory
             .appending(path: "ServeIPA-rebuild-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -191,6 +189,25 @@ enum IPARebuilder {
         let byName = allProjects.first { normalize($0.deletingPathExtension().lastPathComponent) == normalize(appName) }
         guard let project = preferred ?? matches.first ?? byName else { throw RebuildError.projectNotFound(bundleIdentifier, searched: devRoot.path) }
         return project
+    }
+
+    /// Scheme à compiler. Un projet peut contenir plusieurs apps (ex. ServeIPA et ServeIPAClient) : on retient
+    /// d'abord le scheme dont l'app a cet identifiant de bundle, puis celui qui porte le nom de l'app, puis
+    /// celui du projet.
+    nonisolated private static func scheme(in project: URL, bundleIdentifier: String?, appName: String,
+                                           projectName: String) throws -> String {
+        let schemes = try listSchemes(project: project)
+        if let bundleIdentifier,
+           let match = XcodeProjectScanner.inspect(project).first(where: { $0.bundleIdentifier == bundleIdentifier }),
+           let scheme = match.scheme {
+            return scheme
+        }
+        guard let scheme = schemes.first(where: { $0 == appName })
+                ?? schemes.first(where: { $0 == projectName })
+                ?? schemes.first else {
+            throw RebuildError.schemeNotFound(projectName)
+        }
+        return scheme
     }
 
     nonisolated static func listSchemes(project: URL) throws -> [String] {
