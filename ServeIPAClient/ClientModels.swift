@@ -67,6 +67,17 @@ struct InstallRecord: Codable, Equatable {
     }
 }
 
+/// Recompilation en cours (ou dernière terminée) sur le Mac.
+struct RebuildJob: Decodable, Equatable {
+    let id: String
+    let app: String
+    let platform: String
+    /// running, succeeded ou failed.
+    let state: String
+    let step: String
+    let error: String?
+}
+
 struct InstallTicket: Codable {
     let id: String
     let installURL: URL

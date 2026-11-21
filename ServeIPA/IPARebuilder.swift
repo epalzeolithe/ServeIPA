@@ -38,6 +38,7 @@ enum IPARebuilder {
         bundleIdentifier: String?,
         appName: String,
         project projectOverride: URL? = nil,
+        scheme schemeOverride: String? = nil,
         devRoot: URL,
         ipaRoot: URL,
         platform: IPABuild.Platform,
@@ -53,7 +54,8 @@ enum IPARebuilder {
             throw RebuildError.projectNotFound(appName, searched: devRoot.path)
         }
         let projectName = project.deletingPathExtension().lastPathComponent
-        let scheme = try listSchemes(project: project).first { $0 == projectName || $0 == appName }
+        let scheme = try schemeOverride
+            ?? listSchemes(project: project).first { $0 == projectName || $0 == appName }
             ?? listSchemes(project: project).first
             ?? { throw RebuildError.schemeNotFound(projectName) }()
 

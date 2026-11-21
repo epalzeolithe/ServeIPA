@@ -39,6 +39,8 @@ struct ContentView: View {
                       install: { appToInstall = app },
                       download: { store.download(app) },
                       open: { Task { await store.openApp(app) } },
+                      rebuild: { Task { await store.rebuild(app) } },
+                      rebuildDisabled: store.rebuildJob?.state == "running",
                       delete: { appToDelete = app })
             .swipeActions(edge: .trailing) {
                 Button("Supprimer", systemImage: "trash", role: .destructive) { appToDelete = app }
@@ -59,6 +61,11 @@ struct ContentView: View {
                         if let helpURL = URL(string: "https://tailscale.com/docs/install/ios") {
                             Link("Configurer Tailscale", destination: helpURL)
                         }
+                    }
+                }
+                if let job = store.visibleRebuild {
+                    Section("Compilation sur le Mac") {
+                        RebuildStatusRow(job: job, dismiss: { store.dismissRebuild() })
                     }
                 }
                 if let pending = store.pending {
@@ -178,6 +185,8 @@ private struct AppRow: View {
     let install: () -> Void
     let download: () -> Void
     let open: () -> Void
+    let rebuild: () -> Void
+    let rebuildDisabled: Bool
     let delete: () -> Void
 
     private var isLastInstalled: Bool { lastInstall?.appID == app.id }
@@ -228,6 +237,8 @@ private struct AppRow: View {
                         Button("Ouvrir l’app", systemImage: "arrow.up.forward.app", action: open)
                     }
                 }
+                Button("Recompiler sur le Mac", systemImage: "hammer", action: rebuild)
+                    .disabled(rebuildDisabled)
                 Button("Supprimer du serveur", systemImage: "trash", role: .destructive, action: delete)
             } label: {
                 Label("Options", systemImage: "ellipsis.circle")
@@ -265,6 +276,50 @@ private struct AppRow: View {
     private static func shortDate(_ text: String) -> String {
         guard let date = inputFormat.date(from: text) else { return text }
         return date.formatted(.dateTime.day(.twoDigits).month(.twoDigits).year(.twoDigits).hour().minute())
+    }
+}
+
+/// Avancement d'une compilation lancée sur le Mac : étape en cours, succès ou échec.
+private struct RebuildStatusRow: View {
+    let job: RebuildJob
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            switch job.state {
+            case "succeeded":
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.title3)
+            case "failed":
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red).font(.title3)
+            default:
+                ProgressView()
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(job.app) · \(job.platform)")
+                    .font(.subheadline.weight(.semibold))
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(job.state == "failed" ? Color.red : Color.secondary)
+                    .lineLimit(4)
+            }
+            Spacer(minLength: 0)
+            if job.state != "running" {
+                Button("Fermer", systemImage: "xmark.circle.fill", action: dismiss)
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .animation(.smooth, value: job)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var detail: String {
+        switch job.state {
+        case "succeeded": "Terminé — le nouveau build est dans la liste."
+        case "failed": job.error ?? "La compilation a échoué."
+        default: job.step
+        }
     }
 }
 

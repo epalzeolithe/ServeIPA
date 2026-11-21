@@ -1,6 +1,11 @@
 import Foundation
 
 struct IPABuild: Identifiable, Equatable, Sendable {
+    enum Platform: String, CaseIterable, Sendable {
+        case iOS
+        case macOS
+    }
+
     let id: String
     let fileURL: URL
     let relativePath: String
@@ -16,9 +21,12 @@ struct IPABuild: Identifiable, Equatable, Sendable {
     var minimumOSVersion: String? = nil
     /// Chemin de l'icône PNG dans l'archive IPA (nil si l'icône n'existe que dans Assets.car).
     var iconEntry: String? = nil
+    /// iOS : fichier .ipa ; macOS : bundle .app (`fileURL`).
+    var platform: Platform = .iOS
 
     var displayName: String {
-        Self.folderDetails(folderName).name
+        let name = Self.folderDetails(folderName).name
+        return platform == .macOS && name.hasSuffix("-macos") ? String(name.dropLast("-macos".count)) : name
     }
 
     static func folderDetails(_ folder: String) -> (name: String, date: String?) {

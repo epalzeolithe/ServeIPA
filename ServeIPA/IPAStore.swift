@@ -36,6 +36,7 @@ final class IPAStore {
         static let folderBookmark = "ipaFolderBookmark"
         static let startServerAutomatically = "startServerAutomatically"
         static let keepBuildsPerApp = "keepBuildsPerApp"
+        static let projectsBookmark = "projectsFolderBookmark"
     }
 
     var builds: [IPABuild] = []
@@ -45,6 +46,32 @@ final class IPAStore {
     var selectedBuildID: String?
     var folderURL: URL?
     var isScanning = false
+    /// Identifiant de bundle de l'app en cours de recompilation, son étape et la dernière erreur.
+    var rebuildingBundleID: String?
+    var rebuildStatus: String?
+    var rebuildError: String?
+    private var currentJob: RebuildJob?
+    /// Dossier contenant les projets Xcode ; par défaut, le dossier parent des IPA.
+    var projectsFolderURL: URL?
+    /// Dossier réellement utilisé pour chercher les projets (choisi, sinon parent du dossier des IPA).
+    var effectiveProjectsFolder: URL? { projectsFolderURL ?? folderURL?.deletingLastPathComponent() }
+
+    /// Résultat du dernier scan des projets Xcode.
+    var scannedProjects: [ScannedProject] = []
+    var isScanningProjects = false
+    /// Projets inspectés / trouvés pendant le scan en cours.
+    var projectScanProgress: (done: Int, total: Int)?
+    var projectScanError: String?
+    /// Ajout en cours depuis le scan, et état de chaque élément (clé : `addKey`).
+    var isAddingProjects = false
+    var projectAddStates: [String: ProjectAddState] = [:]
+
+    enum ProjectAddState: Equatable {
+        case queued
+        case building(String)
+        case added
+        case failed(String)
+    }
     var launchAtLogin = SMAppService.mainApp.status == .enabled
     var startServerAutomatically: Bool {
         didSet {
@@ -69,6 +96,113 @@ final class IPAStore {
         startServerAutomatically = UserDefaults.standard.bool(forKey: DefaultsKey.startServerAutomatically)
         keepBuildsPerApp = UserDefaults.standard.integer(forKey: DefaultsKey.keepBuildsPerApp)
         restoreFolder()
+        restoreProjectsFolder()
+    }
+
+    // MARK: Scan des projets Xcode
+
+    /// Clé d'un projet à ajouter pour une plateforme.
+    func addKey(_ project: ScannedProject, _ platform: IPABuild.Platform) -> String {
+        "\(project.id)|\(platform.rawValue)"
+    }
+
+    /// Vrai si le dossier des IPA contient déjà un build de cette app pour cette plateforme.
+    func isServed(_ project: ScannedProject, platform: IPABuild.Platform) -> Bool {
+        if let bundle = project.bundleIdentifier,
+           builds.contains(where: { $0.bundleIdentifier == bundle && $0.platform == platform }) {
+            return true
+        }
+        // Identifiant changé depuis l'export (ex. ancien « devplaceholder… ») : on compare aussi le nom.
+        let normalize = { (text: String) in text.lowercased().filter { $0.isLetter || $0.isNumber } }
+        let names = [project.productName, project.scheme].compactMap { $0 }.map(normalize)
+        return builds.contains { $0.platform == platform && names.contains(normalize($0.name)) }
+    }
+
+    /// Cherche les projets Xcode du dossier des projets et lit l'app que chacun produit (4 à la fois).
+    func scanProjects() async {
+        guard !isScanningProjects, let root = effectiveProjectsFolder else { return }
+        isScanningProjects = true
+        projectScanError = nil
+        projectAddStates = [:]
+        defer {
+            isScanningProjects = false
+            projectScanProgress = nil
+        }
+        let ipaRoot = folderURL
+        do {
+            let projects = try await Task.detached { try XcodeProjectScanner.findProjects(in: root, excluding: ipaRoot) }.value
+            projectScanProgress = (0, projects.count)
+            var found: [ScannedProject] = []
+            var done = 0
+            await withTaskGroup(of: [ScannedProject].self) { group in
+                var pending = projects.makeIterator()
+                for _ in 0..<6 {
+                    guard let project = pending.next() else { break }
+                    group.addTask { XcodeProjectScanner.inspect(project) }
+                }
+                for await apps in group {
+                    found += apps
+                    done += 1
+                    projectScanProgress = (done, projects.count)
+                    if let next = pending.next() {
+                        group.addTask { XcodeProjectScanner.inspect(next) }
+                    }
+                }
+            }
+            scannedProjects = found.sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
+        } catch {
+            scannedProjects = []
+            projectScanError = error.localizedDescription
+        }
+    }
+
+    /// Compile et exporte chaque projet choisi, l'un après l'autre (une seule compilation à la fois).
+    func addProjects(_ selection: [(project: ScannedProject, platform: IPABuild.Platform)]) async {
+        guard !isAddingProjects, rebuildingBundleID == nil, !selection.isEmpty else { return }
+        isAddingProjects = true
+        defer { isAddingProjects = false }
+        for item in selection { projectAddStates[addKey(item.project, item.platform)] = .queued }
+        for item in selection {
+            let key = addKey(item.project, item.platform)
+            projectAddStates[key] = .building(String(localized: "Compilation…"))
+            let name = item.project.displayName
+            if let error = await runRebuild(label: name, bundleIdentifier: item.project.bundleIdentifier, appName: name,
+                                            project: item.project.url, scheme: item.project.scheme,
+                                            platform: item.platform,
+                                            reportsError: false, onStep: { [weak self] step in
+                                                self?.projectAddStates[key] = .building(step)
+                                            }) {
+                projectAddStates[key] = .failed(error)
+            } else {
+                projectAddStates[key] = .added
+            }
+        }
+    }
+
+    func chooseProjectsFolder() {
+        let panel = NSOpenPanel()
+        panel.title = String(localized: "Choisir le dossier des projets Xcode")
+        panel.message = String(localized: "ServeIPA y cherchera le projet de chaque app à recompiler.")
+        panel.prompt = String(localized: "Choisir")
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = folderURL?.deletingLastPathComponent()
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        projectsFolderURL?.stopAccessingSecurityScopedResource()
+        _ = url.startAccessingSecurityScopedResource()
+        projectsFolderURL = url
+        if let bookmark = try? url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil) {
+            UserDefaults.standard.set(bookmark, forKey: DefaultsKey.projectsBookmark)
+        }
+    }
+
+    private func restoreProjectsFolder() {
+        guard let bookmark = UserDefaults.standard.data(forKey: DefaultsKey.projectsBookmark) else { return }
+        var stale = false
+        guard let url = try? URL(resolvingBookmarkData: bookmark, options: [.withSecurityScope], relativeTo: nil, bookmarkDataIsStale: &stale) else { return }
+        _ = url.startAccessingSecurityScopedResource()
+        projectsFolderURL = url
     }
 
     func chooseFolder() {
@@ -114,7 +248,122 @@ final class IPAStore {
         if let selectedBuildID, !builds.contains(where: { $0.id == selectedBuildID }) {
             self.selectedBuildID = nil
         }
-        server?.update(builds: builds, rootURL: folderURL, publicURL: serverURL)
+        server?.update(builds: iosBuilds, rootURL: folderURL, publicURL: serverURL)
+    }
+
+    /// Seuls les IPA iOS sont proposés par le serveur OTA.
+    private var iosBuilds: [IPABuild] { builds.filter { $0.platform == .iOS } }
+
+    /// Nombre de builds qui ne sont pas le plus récent de leur app (par plateforme).
+    var oldBuildCount: Int {
+        builds.count - Set(builds.map { "\($0.platform.rawValue)/\($0.bundleIdentifier)" }).count
+    }
+
+    /// Supprime définitivement du disque toutes les anciennes versions, en ne gardant que le build le plus récent de chaque app.
+    func cleanOldVersions() async {
+        guard let folderURL, !isScanning else { return }
+        let current = builds
+        _ = await Task.detached {
+            Self.pruneOldBuilds(current, keep: 1, rootURL: folderURL)
+        }.value
+        await refresh()
+    }
+
+    /// Recompile l'app de ce build depuis son projet Xcode (dossier parent du dossier des IPA)
+    /// et exporte un nouvel IPA dans le dossier des IPA.
+    func rebuild(_ build: IPABuild) async {
+        await runRebuild(label: build.bundleIdentifier, bundleIdentifier: build.bundleIdentifier,
+                         appName: build.name, project: nil, platform: build.platform)
+    }
+
+    /// Ajoute une app : l'utilisateur choisit son projet Xcode, qui est compilé pour `platform`
+    /// et exporté dans le dossier des IPA.
+    func addApp(platform: IPABuild.Platform) async {
+        let panel = NSOpenPanel()
+        panel.title = String(localized: "Choisir le projet Xcode de l’app")
+        panel.prompt = String(localized: "Compiler")
+        // Un .xcodeproj est un paquet : le filtrer par type le grise, on laisse donc le délégué décider.
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        let delegate = XcodeProjectPanelDelegate()
+        panel.delegate = delegate
+        panel.directoryURL = projectsFolderURL ?? folderURL?.deletingLastPathComponent()
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard url.pathExtension == "xcodeproj" else {
+            rebuildError = String(localized: "Choisissez un fichier projet Xcode (.xcodeproj).")
+            return
+        }
+        let name = url.deletingPathExtension().lastPathComponent
+        await runRebuild(label: name, bundleIdentifier: nil, appName: name, project: url, platform: platform)
+    }
+
+    /// Lance une recompilation demandée par un client distant ; retourne l'identifiant du job, ou nil si le Mac est occupé.
+    func startRemoteRebuild(_ build: IPABuild) -> String? {
+        guard folderURL != nil, rebuildingBundleID == nil else { return nil }
+        rebuildingBundleID = build.bundleIdentifier
+        let id = UUID().uuidString
+        Task {
+            await runRebuild(label: build.bundleIdentifier, bundleIdentifier: build.bundleIdentifier,
+                             appName: build.name, project: nil, platform: build.platform,
+                             jobID: id, alreadyClaimed: true)
+        }
+        return id
+    }
+
+    private func updateJob(onlyIfRunning: Bool = false, _ change: (inout RebuildJob) -> Void) {
+        guard var job = currentJob, !onlyIfRunning || job.state == "running" else { return }
+        change(&job)
+        currentJob = job
+        server?.setRebuildJob(job)
+    }
+
+    /// Retourne nil en cas de succès, sinon le message d'erreur (affiché dans une alerte si `reportsError`).
+    @discardableResult
+    private func runRebuild(label: String, bundleIdentifier: String?, appName: String,
+                            project: URL?, scheme: String? = nil, platform: IPABuild.Platform,
+                            jobID: String = UUID().uuidString, alreadyClaimed: Bool = false,
+                            reportsError: Bool = true, onStep: (@MainActor (String) -> Void)? = nil) async -> String? {
+        guard let folderURL, alreadyClaimed || rebuildingBundleID == nil else {
+            if alreadyClaimed { rebuildingBundleID = nil }
+            return String(localized: "Une compilation est déjà en cours, ou le dossier des IPA n’est pas choisi.")
+        }
+        var failure: String?
+        rebuildingBundleID = label
+        rebuildStatus = nil
+        rebuildError = nil
+        let initial = RebuildJob(id: jobID, app: appName, platform: platform.rawValue, state: "running",
+                                 step: String(localized: "Préparation…"), error: nil, startedAt: Date())
+        currentJob = initial
+        server?.setRebuildJob(initial)
+        let root = folderURL
+        do {
+            _ = try await IPARebuilder.rebuild(
+                bundleIdentifier: bundleIdentifier,
+                appName: appName,
+                project: project,
+                scheme: scheme,
+                devRoot: projectsFolderURL ?? root.deletingLastPathComponent(),
+                ipaRoot: root,
+                platform: platform,
+                progress: { message in
+                    Task { @MainActor in
+                        self.rebuildStatus = message
+                        self.updateJob(onlyIfRunning: true) { $0.step = message }
+                        onStep?(message)
+                    }
+                }
+            )
+            updateJob { $0.state = "succeeded"; $0.step = String(localized: "Terminé") }
+        } catch {
+            failure = error.localizedDescription
+            if reportsError { rebuildError = error.localizedDescription }
+            updateJob { $0.state = "failed"; $0.error = error.localizedDescription }
+        }
+        rebuildingBundleID = nil
+        rebuildStatus = nil
+        await refresh()
+        return failure
     }
 
     func delete(_ build: IPABuild) {
@@ -138,7 +387,7 @@ final class IPAStore {
 
         try FileManager.default.removeItem(at: buildDirectoryURL)
         builds.removeAll { $0.fileURL.deletingLastPathComponent().standardizedFileURL == buildDirectoryURL }
-        server?.update(builds: builds, rootURL: folderURL, publicURL: serverURL)
+        server?.update(builds: iosBuilds, rootURL: folderURL, publicURL: serverURL)
         Task { await refresh() }
     }
 
@@ -161,13 +410,17 @@ final class IPAStore {
         do {
             let publicURL = try await Tailscale.publicURL()
             let newServer = try OTAServer(port: port)
-            newServer.update(builds: builds, rootURL: folderURL, publicURL: publicURL)
+            newServer.update(builds: iosBuilds, rootURL: folderURL, publicURL: publicURL)
             newServer.deleteHandler = { [weak self] build in
                 try await MainActor.run {
                     guard let self else { throw DeleteError.unsafeDirectory }
                     try self.removeBuildDirectory(build)
                 }
             }
+            newServer.rebuildHandler = { [weak self] build in
+                await MainActor.run { self?.startRemoteRebuild(build) }
+            }
+            newServer.setRebuildJob(currentJob)
             server = newServer
             try newServer.start()
             try await Tailscale.serve(port: port)
@@ -276,7 +529,7 @@ final class IPAStore {
         }
         var kept: Set<URL> = []
         var candidates: Set<URL> = []
-        for group in Dictionary(grouping: builds, by: \.bundleIdentifier).values {
+        for group in Dictionary(grouping: builds, by: { "\($0.platform.rawValue)/\($0.bundleIdentifier)" }).values {
             let sorted = group.sorted(by: newestFirst)
             sorted.prefix(keep).forEach { kept.insert(directory($0)) }
             sorted.dropFirst(keep).forEach { candidates.insert(directory($0)) }
@@ -294,7 +547,7 @@ final class IPAStore {
         guard let enumerator = FileManager.default.enumerator(
             at: rootURL,
             includingPropertiesForKeys: Array(keys),
-            options: [.skipsHiddenFiles]
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else {
             return ([], [ScanIssue(path: rootURL.path, message: String(localized: "Dossier inaccessible"))])
         }
@@ -302,6 +555,34 @@ final class IPAStore {
         var builds: [IPABuild] = []
         var issues: [ScanIssue] = []
         for case let url as URL in enumerator {
+            if url.pathExtension.lowercased() == "app", url.deletingLastPathComponent() != rootURL {
+                do {
+                    let metadata = try IPAMetadataReader.readApp(url)
+                    let relative = String(url.path.dropFirst(rootURL.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                    let folder = url.deletingLastPathComponent().lastPathComponent
+                    let details = IPABuild.folderDetails(folder)
+                    builds.append(IPABuild(
+                        id: relative,
+                        fileURL: url,
+                        relativePath: relative,
+                        name: metadata.name,
+                        bundleIdentifier: metadata.bundleIdentifier,
+                        version: metadata.version,
+                        build: metadata.build,
+                        platforms: metadata.platforms,
+                        folderName: folder,
+                        folderDate: details.date,
+                        size: IPAMetadataReader.directorySize(url),
+                        urlSchemes: [],
+                        minimumOSVersion: metadata.minimumOSVersion,
+                        iconEntry: metadata.iconEntry,
+                        platform: .macOS
+                    ))
+                } catch {
+                    issues.append(ScanIssue(path: url.lastPathComponent, message: error.localizedDescription))
+                }
+                continue
+            }
             guard url.pathExtension.lowercased() == "ipa",
                   url.deletingLastPathComponent() != rootURL else { continue }
             do {
@@ -384,6 +665,54 @@ enum IPAMetadataReader {
             minimumOSVersion: info["MinimumOSVersion"] as? String,
             iconEntry: iconEntry(entries: entries, info: info)
         )
+    }
+
+    /// Lit les métadonnées d'une app macOS (bundle .app exporté).
+    nonisolated static func readApp(_ appURL: URL) throws -> Metadata {
+        let data = try Data(contentsOf: appURL.appending(path: "Contents/Info.plist"))
+        guard let info = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let bundle = info["CFBundleIdentifier"] as? String,
+              let build = info["CFBundleVersion"] as? String else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        // Icône déclarée (CFBundleIconFile), sinon un .icns, sinon un PNG « icon » dans Resources :
+        // une icône compilée dans Assets.car seule n'est pas lisible hors d'Apple.
+        let resources = appURL.appending(path: "Contents/Resources")
+        let files = ((try? FileManager.default.contentsOfDirectory(atPath: resources.path)) ?? []).sorted()
+        var icon: String?
+        if let file = info["CFBundleIconFile"] as? String, !file.isEmpty {
+            let name = file.hasSuffix(".icns") ? file : file + ".icns"
+            if files.contains(name) { icon = "Contents/Resources/" + name }
+        }
+        if icon == nil,
+           let found = files.first(where: { $0.hasSuffix(".icns") })
+            ?? files.first(where: { $0.hasSuffix(".png") && $0.localizedCaseInsensitiveContains("icon") }) {
+            icon = "Contents/Resources/" + found
+        }
+        return Metadata(
+            name: info["CFBundleDisplayName"] as? String
+                ?? info["CFBundleName"] as? String
+                ?? appURL.deletingPathExtension().lastPathComponent,
+            bundleIdentifier: bundle,
+            version: info["CFBundleShortVersionString"] as? String ?? "",
+            build: build,
+            platforms: info["CFBundleSupportedPlatforms"] as? [String] ?? ["MacOSX"],
+            urlSchemes: [],
+            minimumOSVersion: info["LSMinimumSystemVersion"] as? String,
+            iconEntry: icon
+        )
+    }
+
+    /// Taille cumulée des fichiers d'un bundle.
+    nonisolated static func directorySize(_ url: URL) -> Int64 {
+        guard let enumerator = FileManager.default.enumerator(
+            at: url, includingPropertiesForKeys: [.fileSizeKey], options: []
+        ) else { return 0 }
+        var total: Int64 = 0
+        for case let file as URL in enumerator {
+            total += Int64((try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        }
+        return total
     }
 
     /// Choisit la meilleure icône PNG à la racine du bundle : d'abord les fichiers déclarés
@@ -543,5 +872,15 @@ private enum Tailscale {
             case .commandFailed(let message): message
             }
         }
+    }
+}
+
+/// N'active dans le sélecteur que les projets Xcode et les dossiers (pour naviguer).
+private final class XcodeProjectPanelDelegate: NSObject, NSOpenSavePanelDelegate {
+    func panel(_ sender: Any, shouldEnable url: URL) -> Bool {
+        if url.pathExtension == "xcodeproj" { return true }
+        let isPackage = (try? url.resourceValues(forKeys: [.isPackageKey]))?.isPackage ?? false
+        let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+        return isDirectory && !isPackage
     }
 }

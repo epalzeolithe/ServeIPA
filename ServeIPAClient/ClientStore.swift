@@ -28,6 +28,10 @@ final class ClientStore {
     var downloadedFile: URL?
     var downloadingAppID: String?
     var downloadMessage: String?
+    /// Dernière recompilation connue côté Mac, et celle lancée depuis ce client (affichée jusqu'à sa fermeture).
+    private(set) var rebuildJob: RebuildJob?
+    private var ownedJobID: String?
+    private var dismissedJobID: String?
     private var downloadTask: Task<Void, Never>?
     private var operationID = UUID()
 
@@ -111,6 +115,7 @@ final class ClientStore {
     func monitor() async {
         await refresh()
         while !Task.isCancelled {
+            await pollRebuild()
             await pollInstallation()
             do { try await Task.sleep(for: .seconds(2)) } catch { return }
         }
@@ -179,6 +184,49 @@ final class ClientStore {
             guard self.pending?.ticket.id == pending.ticket.id else { return }
             installMessage = "Suivi indisponible : \(error.localizedDescription)"
         }
+    }
+
+    /// Compilation à afficher : en cours (quel qu'en soit l'initiateur) ou terminée si lancée ici et non fermée.
+    var visibleRebuild: RebuildJob? {
+        guard let job = rebuildJob else { return nil }
+        if job.state == "running" { return job }
+        return job.id == ownedJobID && job.id != dismissedJobID ? job : nil
+    }
+
+    /// Demande au Mac de recompiler l'app (même plateforme que ce build).
+    func rebuild(_ app: RemoteApp) async {
+        do {
+            let base = try ServerAddress.parse(address)
+            var components = URLComponents(url: base.appending(path: "api/v1/builds"), resolvingAgainstBaseURL: false)
+            components?.queryItems = [URLQueryItem(name: "app", value: app.id)]
+            guard let url = components?.url else { throw ClientError.invalidAddress }
+            let data = try await request(url, method: "POST")
+            struct Started: Decodable { let id: String }
+            ownedJobID = try JSONDecoder().decode(Started.self, from: data).id
+            await pollRebuild()
+        } catch ClientError.http(409) {
+            errorMessage = "Une compilation est déjà en cours sur le Mac."
+        } catch ClientError.http(let code) where code == 404 || code == 405 || code == 503 {
+            errorMessage = "Compilation impossible (HTTP \(code)) : l’app n’existe plus, ou ServeIPA doit être mis à jour sur le Mac."
+        } catch {
+            errorMessage = "Compilation impossible : \(error.localizedDescription)"
+        }
+    }
+
+    func dismissRebuild() { dismissedJobID = rebuildJob?.id }
+
+    func pollRebuild() async {
+        guard isConnected, let base = try? ServerAddress.parse(address) else { return }
+        struct Envelope: Decodable { let job: RebuildJob? }
+        guard let data = try? await request(base.appending(path: "api/v1/builds")),
+              let job = (try? JSONDecoder().decode(Envelope.self, from: data))?.job else {
+            rebuildJob = nil
+            return
+        }
+        let finished = rebuildJob?.id == job.id && rebuildJob?.state == "running" && job.state == "succeeded"
+        rebuildJob = job
+        // Le nouveau build vient d'apparaître sur le Mac : on recharge la liste.
+        if finished { await refresh() }
     }
 
     func openApp(_ app: RemoteApp) async {

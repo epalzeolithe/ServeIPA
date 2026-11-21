@@ -1,6 +1,27 @@
 import Foundation
 import Network
 
+/// État de la dernière recompilation lancée sur le Mac, exposé par `GET /api/v1/builds`.
+nonisolated struct RebuildJob: Sendable {
+    var id: String
+    var app: String
+    var platform: String
+    /// running, succeeded ou failed.
+    var state: String
+    var step: String
+    var error: String?
+    var startedAt: Date
+
+    var json: [String: Any] {
+        var object: [String: Any] = [
+            "id": id, "app": app, "platform": platform, "state": state,
+            "step": step, "startedAt": startedAt.timeIntervalSince1970
+        ]
+        object["error"] = error
+        return object
+    }
+}
+
 final class OTAServer: @unchecked Sendable {
     private struct Snapshot {
         var buildsByPath: [String: IPABuild] = [:]
@@ -30,6 +51,9 @@ final class OTAServer: @unchecked Sendable {
 
     /// Supprime un IPA à la demande d'un client (`DELETE /api/v1/apps?app=…`). Défini avant `start()`.
     var deleteHandler: (@Sendable (IPABuild) async throws -> Void)?
+    /// Lance la recompilation d'une app ; retourne l'identifiant du job, ou nil si une compilation est déjà en cours.
+    var rebuildHandler: (@Sendable (IPABuild) async -> String?)?
+    private var rebuildJob: RebuildJob?
 
     private let listener: NWListener
     private let queue = DispatchQueue(label: "ServeIPA.HTTPServer", qos: .userInitiated)
@@ -56,6 +80,10 @@ final class OTAServer: @unchecked Sendable {
                 publicURL: publicURL
             )
         }
+    }
+
+    func setRebuildJob(_ job: RebuildJob?) {
+        lock.withLock { rebuildJob = job }
     }
 
     func start() throws {
@@ -264,6 +292,30 @@ final class OTAServer: @unchecked Sendable {
                     self.send(status: "204 No Content", body: Data(), contentType: "text/plain", on: connection)
                 } catch {
                     self.sendJSON(["error": error.localizedDescription], status: "500 Internal Server Error", on: connection)
+                }
+            }
+            return
+        }
+        if path == "/api/v1/builds", method == "GET" {
+            let job = lock.withLock { rebuildJob }
+            sendJSON(["apiVersion": 1, "job": job?.json ?? NSNull()], on: connection)
+            return
+        }
+        if path == "/api/v1/builds", method == "POST" {
+            guard let buildID = Self.queryValue("app", in: query),
+                  let build = current.buildsByPath[buildID] else {
+                sendJSON(["error": "App unavailable"], status: "404 Not Found", on: connection)
+                return
+            }
+            guard let rebuildHandler else {
+                sendJSON(["error": "Rebuild unavailable"], status: "503 Service Unavailable", on: connection)
+                return
+            }
+            Task {
+                if let jobID = await rebuildHandler(build) {
+                    self.sendJSON(["id": jobID], status: "202 Accepted", on: connection)
+                } else {
+                    self.sendJSON(["error": "A build is already running"], status: "409 Conflict", on: connection)
                 }
             }
             return
