@@ -179,6 +179,55 @@ final class IPAStore {
         }
     }
 
+    // MARK: Mise à jour de ServeIPA
+
+    /// Recompile ServeIPA depuis son projet (macOS, Release), puis le remplace et le relance.
+    func updateServeIPA() async {
+        guard rebuildingBundleID == nil, !isAddingProjects else {
+            rebuildError = String(localized: "Une compilation est déjà en cours. Réessayez quand elle sera terminée.")
+            return
+        }
+        guard let folderURL, let devRoot = effectiveProjectsFolder else {
+            rebuildError = String(localized: "Choisissez d’abord le dossier des IPA.")
+            return
+        }
+        let destination = SelfUpdater.installLocation
+        let alert = NSAlert()
+        alert.messageText = String(localized: "Mettre à jour ServeIPA ?")
+        var details = String(localized: "ServeIPA va se recompiler depuis son projet Xcode (Release), puis se fermer, s’installer dans « \(destination.path) » et se relancer. Le serveur sera interrompu quelques secondes et les suivis d’installation en cours seront perdus.")
+        if SelfUpdater.runsFromBuildFolder {
+            details += "\n\n" + String(localized: "ServeIPA tourne actuellement depuis Xcode : la nouvelle version sera installée dans Applications, et c’est elle qui sera relancée.")
+        }
+        alert.informativeText = details
+        alert.addButton(withTitle: String(localized: "Mettre à jour"))
+        alert.addButton(withTitle: String(localized: "Annuler"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let bundleID = Bundle.main.bundleIdentifier ?? ""
+        rebuildingBundleID = "ServeIPA"
+        rebuildStatus = String(localized: "Recherche du projet…")
+        rebuildError = nil
+        do {
+            let project = try await Task.detached {
+                try IPARebuilder.findProject(bundleIdentifier: bundleID, appName: "ServeIPA", devRoot: devRoot, ipaRoot: folderURL)
+            }.value
+            let export = try await IPARebuilder.rebuild(
+                bundleIdentifier: bundleID, appName: "ServeIPA", project: project,
+                devRoot: devRoot, ipaRoot: folderURL, platform: .macOS,
+                progress: { message in Task { @MainActor in self.rebuildStatus = message } }
+            )
+            let app = try SelfUpdater.exportedApp(in: export)
+            rebuildStatus = String(localized: "Installation et relance…")
+            await stopServer()
+            try SelfUpdater.installAndRelaunch(app, to: destination)
+        } catch {
+            rebuildError = error.localizedDescription
+            rebuildingBundleID = nil
+            rebuildStatus = nil
+            await refresh()
+        }
+    }
+
     func chooseProjectsFolder() {
         let panel = NSOpenPanel()
         panel.title = String(localized: "Choisir le dossier des projets Xcode")

@@ -471,6 +471,29 @@ struct ServeIPASettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Section("Mise à jour de ServeIPA") {
+                LabeledContent("Version", value: AppBuildInfo.current.summary)
+                LabeledContent("Emplacement") {
+                    Text(SelfUpdater.runningApp.path)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Button("Recompiler et relancer ServeIPA…") {
+                    Task { await store.updateServeIPA() }
+                }
+                .disabled(store.folderURL == nil || store.rebuildingBundleID != nil)
+                if let status = store.rebuildStatus, store.rebuildingBundleID == "ServeIPA" {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(status).font(.caption)
+                    }
+                }
+                Text(SelfUpdater.runsFromBuildFolder
+                     ? "ServeIPA tourne depuis Xcode : la version recompilée sera installée dans Applications puis lancée."
+                     : "ServeIPA se recompile depuis son projet Xcode (dossier des projets), remplace l’app installée puis se relance. En cas d’échec de l’installation, l’ancienne version est restaurée.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("Démarrage") {
                 Toggle(
                     "Ouvrir ServeIPA à l’ouverture de session",

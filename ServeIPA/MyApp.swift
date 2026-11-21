@@ -85,6 +85,11 @@ private struct ServerMenu: View {
         Divider()
 
         Text("ServeIPA \(AppBuildInfo.current.summary)")
+        Button("Mettre à jour ServeIPA…", systemImage: "arrow.triangle.2.circlepath") {
+            NSApplication.shared.activate()
+            Task { await store.updateServeIPA() }
+        }
+        .disabled(store.folderURL == nil || store.rebuildingBundleID != nil)
 
         Button("Quitter ServeIPA") {
             NSApplication.shared.terminate(nil)
