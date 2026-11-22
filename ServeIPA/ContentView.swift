@@ -7,6 +7,21 @@ struct ContentView: View {
     @State private var showsCleanConfirmation = false
     @State private var platform: IPABuild.Platform = .iOS
     @State private var showsProjectScan = false
+    @State private var searchText = ""
+
+    /// Builds de la plateforme choisie qui correspondent à la recherche (nom, identifiant, version, build).
+    private var visibleBuilds: [IPABuild] {
+        let builds = store.builds.filter { $0.platform == platform }
+        guard !searchText.isEmpty else { return builds }
+        return builds.filter { (build: IPABuild) -> Bool in
+            let fields: [String] = [build.name, build.displayName, build.bundleIdentifier, build.version, build.build]
+            return fields.contains { (field: String) -> Bool in field.localizedStandardContains(searchText) }
+        }
+    }
+
+    private func buildCount(for platform: IPABuild.Platform) -> Int {
+        store.builds.filter { $0.platform == platform }.count
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -20,7 +35,7 @@ struct ContentView: View {
             Divider()
             Picker("Plateforme", selection: $platform) {
                 ForEach(IPABuild.Platform.allCases, id: \.self) { platform in
-                    Text("\(platform.rawValue) (\(store.builds.filter { $0.platform == platform }.count))")
+                    Text("\(platform.rawValue) (\(buildCount(for: platform)))")
                         .tag(platform)
                 }
             }
@@ -29,10 +44,12 @@ struct ContentView: View {
             .padding(.horizontal)
             .padding(.vertical, 8)
             BuildList(
-                builds: store.builds.filter { $0.platform == platform },
+                builds: visibleBuilds,
                 platform: platform,
+                searchText: searchText,
                 selection: $store.selectedBuildID,
                 oldBuildCount: store.oldBuildCount,
+                newerProjectBuilds: store.newerProjectBuilds,
                 rebuildingBundleID: store.rebuildingBundleID,
                 rebuildStatus: store.rebuildStatus,
                 rebuildAction: { build in Task { await store.rebuild(build) } },
@@ -41,9 +58,10 @@ struct ContentView: View {
             )
         }
         .frame(minWidth: 720, minHeight: 460)
+        .searchable(text: $searchText, prompt: "App, version ou identifiant")
         .toolbar {
             ToolbarItem {
-                Button("Scanner les projets Xcode…", systemImage: "hammer") {
+                Button("Scanner les projets Xcode…", systemImage: "magnifyingglass") {
                     showsProjectScan = true
                 }
                 .help("Chercher les projets Xcode d’un dossier et ajouter leurs apps")
@@ -68,10 +86,12 @@ struct ContentView: View {
                 .disabled(store.folderURL == nil || store.isScanning)
             }
             ToolbarItem {
-                Button("Nettoyer les anciennes versions", systemImage: "sparkles") {
+                Button("Mettre à jour et nettoyer", systemImage: "wand.and.sparkles") {
                     showsCleanConfirmation = true
                 }
-                .disabled(store.oldBuildCount == 0 || store.isScanning)
+                .help("Recompiler les apps dont le projet est plus récent, et supprimer les anciennes versions")
+                .disabled((store.oldBuildCount == 0 && store.outdatedBuilds.isEmpty) || store.isScanning
+                          || store.rebuildingBundleID != nil)
             }
         }
         .sheet(isPresented: $showsProjectScan) {
@@ -86,15 +106,29 @@ struct ContentView: View {
             Text(store.rebuildError ?? "")
         }
         .confirmationDialog(
-            "Supprimer toutes les anciennes versions ?",
+            store.outdatedBuilds.isEmpty ? "Supprimer toutes les anciennes versions ?" : "Mettre à jour et nettoyer ?",
             isPresented: $showsCleanConfirmation,
             titleVisibility: .visible
         ) {
-            Button("Supprimer \(store.oldBuildCount) ancien(s) build(s)", role: .destructive) {
-                Task { await store.cleanOldVersions() }
+            let outdated = store.outdatedBuilds.count
+            let old = store.oldBuildCount
+            if outdated > 0 {
+                Button(old > 0 ? "Recompiler \(outdated) app(s) puis nettoyer" : "Recompiler \(outdated) app(s)") {
+                    Task { await store.updateOutdatedBuilds(thenClean: old > 0) }
+                }
+            }
+            if old > 0 {
+                Button("Supprimer \(old) ancien(s) build(s)", role: .destructive) {
+                    Task { await store.cleanOldVersions() }
+                }
             }
         } message: {
-            Text("Seul le build le plus récent de chaque app est conservé. Les dossiers des autres sont supprimés définitivement du disque.")
+            let names = store.outdatedBuilds.map { "\($0.name) (\($0.platform.rawValue))" }.formatted()
+            if store.outdatedBuilds.isEmpty {
+                Text("Seul le build le plus récent de chaque app est conservé. Les dossiers des autres sont supprimés définitivement du disque.")
+            } else {
+                Text("Projets plus récents que leur release : \(names). Ils seront recompilés l’un après l’autre. Le nettoyage ne conserve ensuite que le build le plus récent de chaque app ; les autres dossiers sont supprimés définitivement.")
+            }
         }
         .confirmationDialog(
             "Supprimer ce répertoire et son IPA ?",
@@ -186,8 +220,12 @@ private struct BuildGroup: Identifiable {
 private struct BuildList: View {
     let builds: [IPABuild]
     let platform: IPABuild.Platform
+    /// Recherche en cours : les groupes sont dépliés pour montrer tous les builds correspondants.
+    let searchText: String
     @Binding var selection: String?
     let oldBuildCount: Int
+    /// Numéro de build du projet Xcode, pour les releases dont le projet est plus récent.
+    let newerProjectBuilds: [String: Int]
     let rebuildingBundleID: String?
     let rebuildStatus: String?
     let rebuildAction: (IPABuild) -> Void
@@ -199,7 +237,7 @@ private struct BuildList: View {
 
     private func expansionBinding(for id: String) -> Binding<Bool> {
         Binding(
-            get: { expandedGroups.contains(id) },
+            get: { expandedGroups.contains(id) || !searchText.isEmpty },
             set: { if $0 { expandedGroups.insert(id) } else { expandedGroups.remove(id) } }
         )
     }
@@ -210,7 +248,8 @@ private struct BuildList: View {
     }
 
     private func row(for build: IPABuild, isLatest: Bool, olderCount: Int = 0) -> some View {
-        BuildRow(build: build, isLatest: isLatest, olderCount: olderCount)
+        BuildRow(build: build, isLatest: isLatest, olderCount: olderCount,
+                 newerProjectBuild: isLatest ? newerProjectBuilds[build.id] : nil)
             .tag(build.id)
             .simultaneousGesture(TapGesture(count: 2).onEnded {
                 if build.platform == .macOS { launch(build) }
@@ -242,9 +281,11 @@ private struct BuildList: View {
     var body: some View {
         if builds.isEmpty {
             ContentUnavailableView(
-                platform == .iOS ? "Aucun IPA" : "Aucune app macOS",
-                systemImage: "shippingbox",
-                description: Text(platform == .iOS
+                !searchText.isEmpty ? "Aucun résultat" : platform == .iOS ? "Aucun IPA" : "Aucune app macOS",
+                systemImage: searchText.isEmpty ? "shippingbox" : "magnifyingglass",
+                description: Text(!searchText.isEmpty
+                    ? "Aucun build ne correspond à « \(searchText) »."
+                    : platform == .iOS
                     ? "Choisissez un dossier contenant des IPA dans ses sous-dossiers."
                     : "Ajoutez une app avec le bouton + de la barre d’outils, ou exportez-la dans un sous-dossier.")
             )
@@ -279,8 +320,11 @@ private struct BuildList: View {
                         Text("\(groups.count) apps · \(builds.count) builds")
                             .foregroundStyle(.secondary)
                         Spacer()
-                        Button("Nettoyer les anciennes versions", systemImage: "sparkles", action: cleanAction)
-                            .disabled(oldBuildCount == 0)
+                        Text("ServeIPA \(AppBuildInfo.current.summary)")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .padding(.trailing, 8)
                         if let selected = builds.first(where: { $0.id == selection }) {
                             Button("Recompiler", systemImage: "hammer") {
                                 rebuildAction(selected)
@@ -350,6 +394,8 @@ private struct BuildRow: View {
     /// Build le plus récent de son app (ligne principale du groupe, avec icône et nom).
     let isLatest: Bool
     let olderCount: Int
+    /// Numéro de build du projet Xcode s'il est plus récent que cette release.
+    var newerProjectBuild: Int?
 
     var body: some View {
         HStack(spacing: 10) {
@@ -366,6 +412,17 @@ private struct BuildRow: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .layoutPriority(1)
+                    if let newerProjectBuild {
+                        Label("Build \(newerProjectBuild)", systemImage: "arrow.up.circle.fill")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(.orange.opacity(0.18), in: .capsule)
+                            .foregroundStyle(.orange)
+                            .lineLimit(1)
+                            .help("Le projet Xcode est au build \(newerProjectBuild), plus récent que cette release (\(build.build)). Recompilez pour l’exporter.")
+                            .accessibilityLabel("Projet plus récent : build \(newerProjectBuild)")
+                    }
                 }
                 Text(details)
                     .font(.caption.monospacedDigit())
@@ -377,7 +434,7 @@ private struct BuildRow: View {
         .padding(.vertical, 2)
     }
 
-    /// Date · taille · iOS minimum · anciens builds · nom du dossier s'il diffère du nom de l'app.
+    /// Date · taille · OS minimum · anciens builds · nom du dossier s'il diffère du nom de l'app.
     private var details: String {
         var parts: [String] = []
         if let date = build.folderDate { parts.append(Self.shortDate(date)) }
@@ -385,7 +442,6 @@ private struct BuildRow: View {
         if let minimum = build.minimumOSVersion { parts.append("\(build.platform == .macOS ? "macOS" : "iOS") \(minimum)+") }
         if olderCount > 0 { parts.append(olderCount == 1 ? "1 ancien" : "\(olderCount) anciens") }
         if build.displayName != build.name { parts.append(build.displayName) }
-        if isLatest { parts.append(build.bundleIdentifier) }
         return parts.joined(separator: " · ")
     }
 

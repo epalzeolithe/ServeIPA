@@ -19,6 +19,12 @@ struct RemoteApp: Codable, Identifiable, Equatable {
     let minimumOSVersion: String?
     /// Absent sur les serveurs plus anciens.
     let hasIcon: Bool?
+    /// « iOS » ou « macOS » ; absent sur les serveurs plus anciens (qui ne servent que des IPA).
+    let platform: String?
+    /// Numéro de build du projet Xcode quand il dépasse celui de ce build ; absent sinon (ou serveur ancien).
+    let projectBuild: Int?
+
+    var isMac: Bool { platform == "macOS" }
 
     var launchURL: URL? {
         // Schemes used by system services or sign-in providers aren't app launch contracts.

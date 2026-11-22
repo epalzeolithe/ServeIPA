@@ -24,7 +24,10 @@ nonisolated struct RebuildJob: Sendable {
 
 final class OTAServer: @unchecked Sendable {
     private struct Snapshot {
+        /// Builds iOS (IPA), servis par le flux d'installation OTA.
         var buildsByPath: [String: IPABuild] = [:]
+        /// Apps macOS (.app), proposées seulement par l'API (`?platform=macOS`) sous forme d'archive zip.
+        var macBuildsByPath: [String: IPABuild] = [:]
         var rootURL: URL?
         var publicURL: URL?
     }
@@ -54,6 +57,8 @@ final class OTAServer: @unchecked Sendable {
     /// Lance la recompilation d'une app ; retourne l'identifiant du job, ou nil si une compilation est déjà en cours.
     var rebuildHandler: (@Sendable (IPABuild) async -> String?)?
     private var rebuildJob: RebuildJob?
+    /// Numéro de build du projet Xcode, par identifiant de build, quand il dépasse celui de la release.
+    private var projectBuilds: [String: Int] = [:]
 
     private let listener: NWListener
     private let queue = DispatchQueue(label: "ServeIPA.HTTPServer", qos: .userInitiated)
@@ -75,11 +80,16 @@ final class OTAServer: @unchecked Sendable {
     func update(builds: [IPABuild], rootURL: URL, publicURL: URL?) {
         lock.withLock {
             snapshot = Snapshot(
-                buildsByPath: Dictionary(uniqueKeysWithValues: builds.map { ($0.relativePath, $0) }),
+                buildsByPath: Dictionary(uniqueKeysWithValues: builds.filter { $0.platform == .iOS }.map { ($0.relativePath, $0) }),
+                macBuildsByPath: Dictionary(uniqueKeysWithValues: builds.filter { $0.platform == .macOS }.map { ($0.relativePath, $0) }),
                 rootURL: rootURL,
                 publicURL: publicURL
             )
         }
+    }
+
+    func setProjectBuilds(_ builds: [String: Int]) {
+        lock.withLock { projectBuilds = builds }
     }
 
     func setRebuildJob(_ job: RebuildJob?) {
@@ -235,7 +245,9 @@ final class OTAServer: @unchecked Sendable {
             return
         }
         if path == "/api/v1/apps", method == "GET" {
-            let apps: [[String: Any]] = current.buildsByPath.values.sorted {
+            let projectBuilds = lock.withLock { self.projectBuilds }
+            let wantsMac = Self.queryValue("platform", in: query) == "macOS"
+            let apps: [[String: Any]] = (wantsMac ? current.macBuildsByPath : current.buildsByPath).values.sorted {
                 ($0.folderDate ?? $0.folderName, $0.name) > ($1.folderDate ?? $1.folderName, $1.name)
             }.map { build in
                 var object: [String: Any] = [
@@ -243,10 +255,12 @@ final class OTAServer: @unchecked Sendable {
                     "bundleIdentifier": build.bundleIdentifier, "version": build.version,
                     "build": build.build, "size": build.size, "platforms": build.platforms,
                     "urlSchemes": build.urlSchemes,
+                    "platform": build.platform.rawValue,
                     "hasIcon": build.iconEntry != nil
                 ]
                 object["date"] = build.folderDate
                 object["minimumOSVersion"] = build.minimumOSVersion
+                object["projectBuild"] = projectBuilds[build.id]
                 return object
             }
             sendJSON(["apiVersion": 1, "apps": apps], on: connection)
@@ -254,7 +268,7 @@ final class OTAServer: @unchecked Sendable {
         }
         if path == "/api/v1/apps/icon", method == "GET" || method == "HEAD" {
             guard let buildID = Self.queryValue("app", in: query),
-                  let build = current.buildsByPath[buildID],
+                  let build = current.buildsByPath[buildID] ?? current.macBuildsByPath[buildID],
                   let entry = build.iconEntry else {
                 sendJSON(["error": "Icon unavailable"], status: "404 Not Found", on: connection)
                 return
@@ -266,7 +280,10 @@ final class OTAServer: @unchecked Sendable {
             // L'extraction lance unzip : hors de la file du serveur pour ne pas bloquer les autres requêtes.
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 guard let self else { return }
-                guard let png = IPAMetadataReader.iconPNG(ipaURL: build.fileURL, entry: entry) else {
+                let png = build.platform == .macOS
+                    ? IPAMetadataReader.iconPNG(appURL: build.fileURL, entry: entry)
+                    : IPAMetadataReader.iconPNG(ipaURL: build.fileURL, entry: entry)
+                guard let png else {
                     self.sendJSON(["error": "Icon unreadable"], status: "404 Not Found", on: connection)
                     return
                 }
@@ -275,9 +292,26 @@ final class OTAServer: @unchecked Sendable {
             }
             return
         }
+        if path == "/api/v1/apps/archive", method == "GET" || method == "HEAD" {
+            guard let buildID = Self.queryValue("app", in: query),
+                  let build = current.macBuildsByPath[buildID] else {
+                sendJSON(["error": "App unavailable"], status: "404 Not Found", on: connection)
+                return
+            }
+            // Le zip d'un bundle .app est créé (puis réutilisé) hors de la file du serveur.
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self else { return }
+                guard let archive = Self.macArchive(for: build) else {
+                    self.sendJSON(["error": "Archive failed"], status: "500 Internal Server Error", on: connection)
+                    return
+                }
+                self.sendFile(archive, key: "archive-\(buildID)", method: method, on: connection)
+            }
+            return
+        }
         if path == "/api/v1/apps", method == "DELETE" {
             guard let buildID = Self.queryValue("app", in: query),
-                  let build = current.buildsByPath[buildID] else {
+                  let build = current.buildsByPath[buildID] ?? current.macBuildsByPath[buildID] else {
                 sendJSON(["error": "App unavailable"], status: "404 Not Found", on: connection)
                 return
             }
@@ -288,7 +322,10 @@ final class OTAServer: @unchecked Sendable {
             Task {
                 do {
                     try await deleteHandler(build)
-                    self.lock.withLock { self.snapshot.buildsByPath[buildID] = nil }
+                    self.lock.withLock {
+                        self.snapshot.buildsByPath[buildID] = nil
+                        self.snapshot.macBuildsByPath[buildID] = nil
+                    }
                     self.send(status: "204 No Content", body: Data(), contentType: "text/plain", on: connection)
                 } catch {
                     self.sendJSON(["error": error.localizedDescription], status: "500 Internal Server Error", on: connection)
@@ -303,7 +340,7 @@ final class OTAServer: @unchecked Sendable {
         }
         if path == "/api/v1/builds", method == "POST" {
             guard let buildID = Self.queryValue("app", in: query),
-                  let build = current.buildsByPath[buildID] else {
+                  let build = current.buildsByPath[buildID] ?? current.macBuildsByPath[buildID] else {
                 sendJSON(["error": "App unavailable"], status: "404 Not Found", on: connection)
                 return
             }
@@ -385,6 +422,28 @@ final class OTAServer: @unchecked Sendable {
             return
         }
         send(status: status, body: data, contentType: "application/json; charset=utf-8", on: connection)
+    }
+
+    /// Zip du bundle .app (ditto conserve liens et signature), mis en cache dans le dossier temporaire.
+    private nonisolated static func macArchive(for build: IPABuild) -> URL? {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "ServeIPA-archives", directoryHint: .isDirectory)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let name = String(build.id.unicodeScalars.map { $0.properties.isAlphabetic || ("0"..."9").contains($0) ? Character($0) : "_" })
+        let archive = directory.appending(path: name + ".zip")
+        if FileManager.default.fileExists(atPath: archive.path) { return archive }
+        let partial = directory.appending(path: name + ".partial")
+        try? FileManager.default.removeItem(at: partial)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        process.arguments = ["-c", "-k", "--keepParent", build.fileURL.path, partial.path]
+        guard (try? process.run()) != nil else { return nil }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0,
+              (try? FileManager.default.moveItem(at: partial, to: archive)) != nil else {
+            try? FileManager.default.removeItem(at: partial)
+            return nil
+        }
+        return archive
     }
 
     private static func queryValue(_ name: String, in query: String) -> String? {

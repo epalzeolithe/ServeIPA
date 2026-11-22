@@ -10,7 +10,7 @@ import SwiftUI
 @main
 struct ServeIPAClientApp: App {
     var body: some Scene {
-        WindowGroup {
+        WindowGroup("ServeIPA Client") {
             ContentView()
         }
     }

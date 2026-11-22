@@ -13,6 +13,9 @@ struct ProjectScanView: View {
             folderBar
             Divider()
             content
+            if store.isAddingProjects || !addStates.isEmpty {
+                buildBanner
+            }
             Divider()
             footer
         }
@@ -68,7 +71,7 @@ struct ProjectScanView: View {
         } else if let error = store.projectScanError {
             ContentUnavailableView("Scan impossible", systemImage: "exclamationmark.triangle", description: Text(error))
         } else if store.scannedProjects.isEmpty {
-            ContentUnavailableView("Aucun projet Xcode", systemImage: "hammer",
+            ContentUnavailableView("Aucun projet Xcode", systemImage: "magnifyingglass",
                                    description: Text("Aucun fichier .xcodeproj dans ce dossier (jusqu’à 3 niveaux)."))
         } else {
             List {
@@ -105,13 +108,86 @@ struct ProjectScanView: View {
                 if let problem = project.problem {
                     Text(problem).font(.caption).foregroundStyle(.orange)
                 }
+                buildDetails(project)
             }
             Spacer()
-            ForEach(project.platforms, id: \.self) { platform in
-                platformControl(project, platform)
+            HStack(spacing: 8) {
+                ForEach(project.platforms, id: \.self) { platform in
+                    platformControl(project, platform)
+                }
             }
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 4)
+        .animation(.smooth, value: store.projectAddStates)
+    }
+
+    /// Étape en cours ou message d'échec, sous la ligne du projet.
+    @ViewBuilder
+    private func buildDetails(_ project: ScannedProject) -> some View {
+        ForEach(project.platforms, id: \.self) { platform in
+            switch store.projectAddStates[store.addKey(project, platform)] {
+            case .building(let step):
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("\(platform.rawValue) · \(step)", systemImage: platform == .iOS ? "iphone" : "macbook")
+                        .font(.caption)
+                        .foregroundStyle(.tint)
+                        .lineLimit(1)
+                    ProgressView().progressViewStyle(.linear).frame(maxWidth: 280)
+                }
+                .padding(.top, 2)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            case .failed(let message):
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .lineLimit(3)
+                    .textSelection(.enabled)
+                    .padding(.top, 2)
+            default:
+                EmptyView()
+            }
+        }
+    }
+
+    // MARK: Bandeau de compilation
+
+    private var addStates: [String: IPAStore.ProjectAddState] { store.projectAddStates }
+
+    private var buildBanner: some View {
+        let states = Array(addStates.values)
+        let failed = states.filter { if case .failed = $0 { true } else { false } }.count
+        let added = states.filter { $0 == .added }.count
+        let finished = added + failed
+        let current = addStates.first { if case .building = $0.value { true } else { false } }
+        let currentName = current.flatMap { entry in
+            store.scannedProjects.first { entry.key.hasPrefix($0.id + "|") }?.displayName
+        }
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                if store.isAddingProjects {
+                    ProgressView().controlSize(.small)
+                    Text(currentName.map { "Compilation de \($0)" } ?? "Préparation…")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Text("\(min(finished + 1, states.count)) sur \(states.count)")
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                } else {
+                    Image(systemName: failed == 0 ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(failed == 0 ? Color.green : Color.orange)
+                    Text(failed == 0 ? "\(added) app(s) ajoutée(s)" : "\(added) ajoutée(s), \(failed) en échec")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                }
+            }
+            if store.isAddingProjects {
+                ProgressView(value: Double(finished), total: Double(max(states.count, 1)))
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 10)
+        .background(.bar)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 
     @ViewBuilder
@@ -120,23 +196,17 @@ struct ProjectScanView: View {
         if let state = store.projectAddStates[key] {
             switch state {
             case .queued:
-                Label("\(platform.rawValue) : en attente", systemImage: "clock").foregroundStyle(.secondary)
-            case .building(let step):
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.small)
-                    Text("\(platform.rawValue) : \(step)").lineLimit(1)
-                }
-                .frame(maxWidth: 260, alignment: .trailing)
+                chip(platform.rawValue, systemImage: "clock", tint: .secondary)
+            case .building:
+                chip(platform.rawValue, systemImage: nil, tint: .accentColor, spinner: true)
             case .added:
-                Label("\(platform.rawValue) ajoutée", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                chip(platform.rawValue, systemImage: "checkmark.circle.fill", tint: .green)
             case .failed(let message):
-                Label("\(platform.rawValue) : échec", systemImage: "xmark.octagon.fill")
-                    .foregroundStyle(.red)
+                chip(platform.rawValue, systemImage: "xmark.octagon.fill", tint: .red)
                     .help(message)
             }
         } else if store.isServed(project, platform: platform) {
-            Label(platform.rawValue, systemImage: "checkmark.seal")
-                .foregroundStyle(.secondary)
+            chip(platform.rawValue, systemImage: "checkmark.seal", tint: .secondary)
                 .help("Un build de cette app est déjà dans le dossier des IPA.")
         } else {
             Toggle(platform.rawValue, isOn: Binding(
@@ -148,6 +218,24 @@ struct ProjectScanView: View {
         }
     }
 
+    /// Pastille d'état d'une plateforme.
+    private func chip(_ title: String, systemImage: String?, tint: Color, spinner: Bool = false) -> some View {
+        HStack(spacing: 5) {
+            if spinner {
+                ProgressView().controlSize(.mini)
+            } else if let systemImage {
+                Image(systemName: systemImage)
+            }
+            Text(title)
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(tint)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(tint.opacity(0.14), in: .capsule)
+        .contentTransition(.symbolEffect(.replace))
+    }
+
     // MARK: Pied
 
     private var footer: some View {
@@ -156,7 +244,7 @@ struct ProjectScanView: View {
                 .toggleStyle(.checkbox)
             Spacer()
             if store.isAddingProjects {
-                Text("Compilation en cours : vous pouvez fermer cette fenêtre.")
+                Text("Vous pouvez fermer cette fenêtre.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

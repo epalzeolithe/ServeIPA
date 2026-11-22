@@ -297,11 +297,39 @@ final class IPAStore {
         if let selectedBuildID, !builds.contains(where: { $0.id == selectedBuildID }) {
             self.selectedBuildID = nil
         }
-        server?.update(builds: iosBuilds, rootURL: folderURL, publicURL: serverURL)
+        server?.update(builds: builds, rootURL: folderURL, publicURL: serverURL)
+        Task { await updateNewerProjectBuilds() }
     }
 
-    /// Seuls les IPA iOS sont proposés par le serveur OTA.
-    private var iosBuilds: [IPABuild] { builds.filter { $0.platform == .iOS } }
+    /// Numéro de build du projet, par identifiant de build, pour les releases dont le projet est plus récent.
+    var newerProjectBuilds: [String: Int] = [:]
+
+    /// Compare le build le plus récent de chaque app au numéro de build courant de son projet Xcode.
+    func updateNewerProjectBuilds() async {
+        guard let folderURL, let devRoot = effectiveProjectsFolder else {
+            newerProjectBuilds = [:]
+            return
+        }
+        let latest = Dictionary(grouping: builds, by: { "\($0.platform.rawValue)/\($0.bundleIdentifier)" })
+            .values.compactMap { group in
+                group.max { ($0.folderDate ?? $0.folderName, Int($0.build) ?? -1) < ($1.folderDate ?? $1.folderName, Int($1.build) ?? -1) }
+            }
+        let result = await Task.detached {
+            var projectBuilds: [URL: Int?] = [:]
+            var newer: [String: Int] = [:]
+            for build in latest {
+                guard let released = Int(build.build),
+                      let project = try? IPARebuilder.findProject(bundleIdentifier: build.bundleIdentifier, appName: build.name,
+                                                                  devRoot: devRoot, ipaRoot: folderURL) else { continue }
+                let current = projectBuilds[project] ?? ProjectBuildNumber.read(project: project)
+                projectBuilds[project] = current
+                if let current, current > released { newer[build.id] = current }
+            }
+            return newer
+        }.value
+        newerProjectBuilds = result
+        server?.setProjectBuilds(result)
+    }
 
     /// Nombre de builds qui ne sont pas le plus récent de leur app (par plateforme).
     var oldBuildCount: Int {
@@ -316,6 +344,28 @@ final class IPAStore {
             Self.pruneOldBuilds(current, keep: 1, rootURL: folderURL)
         }.value
         await refresh()
+    }
+
+    /// Builds les plus récents dont le projet Xcode est à un numéro de build plus avancé.
+    var outdatedBuilds: [IPABuild] { builds.filter { newerProjectBuilds[$0.id] != nil } }
+
+    /// Recompile, l'un après l'autre, chaque app dont le projet est plus récent que sa release, puis
+    /// (si `clean`) supprime les anciennes versions.
+    func updateOutdatedBuilds(thenClean clean: Bool) async {
+        guard !isScanning, !isAddingProjects, rebuildingBundleID == nil else { return }
+        let targets = outdatedBuilds
+        var failures: [String] = []
+        for (index, build) in targets.enumerated() {
+            let position = "\(index + 1)/\(targets.count)"
+            let error = await runRebuild(
+                label: build.bundleIdentifier, bundleIdentifier: build.bundleIdentifier, appName: build.name,
+                project: nil, platform: build.platform, reportsError: false,
+                onStep: { [weak self] step in self?.rebuildStatus = "\(position) · \(step)" }
+            )
+            if let error { failures.append("\(build.name) (\(build.platform.rawValue)) : \(error)") }
+        }
+        if clean { await cleanOldVersions() }
+        if !failures.isEmpty { rebuildError = failures.joined(separator: "\n\n") }
     }
 
     /// Recompile l'app de ce build depuis son projet Xcode (dossier parent du dossier des IPA)
@@ -436,7 +486,7 @@ final class IPAStore {
 
         try FileManager.default.removeItem(at: buildDirectoryURL)
         builds.removeAll { $0.fileURL.deletingLastPathComponent().standardizedFileURL == buildDirectoryURL }
-        server?.update(builds: iosBuilds, rootURL: folderURL, publicURL: serverURL)
+        server?.update(builds: builds, rootURL: folderURL, publicURL: serverURL)
         Task { await refresh() }
     }
 
@@ -459,7 +509,7 @@ final class IPAStore {
         do {
             let publicURL = try await Tailscale.publicURL()
             let newServer = try OTAServer(port: port)
-            newServer.update(builds: iosBuilds, rootURL: folderURL, publicURL: publicURL)
+            newServer.update(builds: builds, rootURL: folderURL, publicURL: publicURL)
             newServer.deleteHandler = { [weak self] build in
                 try await MainActor.run {
                     guard let self else { throw DeleteError.unsafeDirectory }
@@ -470,6 +520,7 @@ final class IPAStore {
                 await MainActor.run { self?.startRemoteRebuild(build) }
             }
             newServer.setRebuildJob(currentJob)
+            newServer.setProjectBuilds(newerProjectBuilds)
             server = newServer
             try newServer.start()
             try await Tailscale.serve(port: port)
@@ -793,8 +844,18 @@ enum IPAMetadataReader {
     /// Extrait l'icône de l'IPA et la réencode en PNG standard (les PNG iOS sont au format
     /// optimisé « CgBI », que ImageIO sait décoder), réduite à `maxPixels`.
     nonisolated static func iconPNG(ipaURL: URL, entry: String, maxPixels: Int = 180) -> Data? {
-        guard let raw = try? runUnzipData(arguments: ["-p", ipaURL.path, entry]),
-              let source = CGImageSourceCreateWithData(raw as CFData, nil),
+        guard let raw = try? runUnzipData(arguments: ["-p", ipaURL.path, entry]) else { return nil }
+        return pngThumbnail(raw, maxPixels: maxPixels)
+    }
+
+    /// Icône d'une app macOS (.icns ou PNG dans le bundle), convertie en PNG.
+    nonisolated static func iconPNG(appURL: URL, entry: String, maxPixels: Int = 180) -> Data? {
+        guard let raw = try? Data(contentsOf: appURL.appending(path: entry)) else { return nil }
+        return pngThumbnail(raw, maxPixels: maxPixels)
+    }
+
+    nonisolated private static func pngThumbnail(_ raw: Data, maxPixels: Int) -> Data? {
+        guard let source = CGImageSourceCreateWithData(raw as CFData, nil),
               let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
                   kCGImageSourceCreateThumbnailFromImageAlways: true,
                   kCGImageSourceCreateThumbnailWithTransform: true,

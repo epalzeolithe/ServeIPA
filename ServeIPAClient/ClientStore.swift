@@ -1,6 +1,30 @@
 import Foundation
 import Observation
+#if canImport(UIKit)
 import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
+
+/// Différences entre iOS et macOS. Le client iOS installe des IPA par OTA ; le client Mac liste les apps macOS
+/// du serveur et les installe dans /Applications.
+@MainActor
+enum Platform {
+    #if os(macOS)
+    static let isMac = true
+    static var isActive: Bool { NSApplication.shared.isActive }
+    static func canOpen(_ url: URL) -> Bool { false }
+    static func open(_ url: URL) async -> Bool { NSWorkspace.shared.open(url) }
+    #else
+    static let isMac = false
+    static var isActive: Bool { UIApplication.shared.applicationState == .active }
+    static func canOpen(_ url: URL) -> Bool { UIApplication.shared.canOpenURL(url) }
+    static func open(_ url: URL) async -> Bool { await UIApplication.shared.open(url) }
+    #endif
+
+    /// Plateforme des builds affichés par ce client.
+    static var serverPlatform: String { isMac ? "macOS" : "iOS" }
+}
 
 @MainActor
 @Observable
@@ -28,6 +52,10 @@ final class ClientStore {
     var downloadedFile: URL?
     var downloadingAppID: String?
     var downloadMessage: String?
+    /// Apps installées dans Applications (macOS), par identifiant de bundle ; relues à chaque actualisation.
+    #if os(macOS)
+    private(set) var installedApps: [String: InstalledApp] = [:]
+    #endif
     /// Dernière recompilation connue côté Mac, et celle lancée depuis ce client (affichée jusqu'à sa fermeture).
     private(set) var rebuildJob: RebuildJob?
     private var ownedJobID: String?
@@ -69,6 +97,9 @@ final class ClientStore {
     }
 
     func refresh() async {
+        #if os(macOS)
+        await reloadInstalledApps()
+        #endif
         guard !isLoading else { return }
         isLoading = true
         defer { isLoading = false }
@@ -90,11 +121,15 @@ final class ClientStore {
             let info = health.serverBuild.map {
                 AppBuildInfo(version: health.serverVersion ?? "—", build: $0, rawDate: health.serverBuildDate)
             }
-            let catalogData = try await request(base.appending(path: "api/v1/apps"))
+            var catalogComponents = URLComponents(url: base.appending(path: "api/v1/apps"), resolvingAgainstBaseURL: false)
+            if Platform.isMac { catalogComponents?.queryItems = [URLQueryItem(name: "platform", value: "macOS")] }
+            guard let catalogURL = catalogComponents?.url else { throw ClientError.invalidAddress }
+            let catalogData = try await request(catalogURL)
             let catalog = try JSONDecoder().decode(AppCatalog.self, from: catalogData)
             guard catalog.apiVersion == 1 else { throw ClientError.incompatibleServer }
             guard address == requestedAddress else { return }
-            apps = catalog.apps
+            // Un ancien serveur ne publie pas la plateforme et ne sert que des IPA iOS.
+            apps = catalog.apps.filter { ($0.isMac) == Platform.isMac }
             serverInfo = info
             isConnected = true
             connectionMessage = base.host?.hasSuffix(".ts.net") == true
@@ -122,19 +157,22 @@ final class ClientStore {
     }
 
     func install(_ app: RemoteApp) async {
+        #if os(macOS)
+        await installMac(app)
+        #else
         do {
             let base = try ServerAddress.parse(address)
             let ticket = try await createTicket(app, server: base)
             let launchURL = app.launchURL
             let declared = Bundle.main.object(forInfoDictionaryKey: "LSApplicationQueriesSchemes") as? [String] ?? []
             let supported = launchURL.map { declared.contains($0.scheme ?? "") } ?? false
-            let detected = supported && launchURL.map { UIApplication.shared.canOpenURL($0) } == true
+            let detected = supported && launchURL.map { Platform.canOpen($0) } == true
             pending = PendingInstall(app: app, ticket: ticket, server: base, createdAt: Date(),
                                      wasDetectable: detected, detectionSupported: supported)
             transfer = nil
             installMessage = "Demande envoyée à iOS. Confirmez l’installation, puis revenez ici pour le suivi."
             persistPending()
-            guard await UIApplication.shared.open(ticket.installURL) else {
+            guard await Platform.open(ticket.installURL) else {
                 clearPending()
                 throw ClientError.invalidLink
             }
@@ -145,7 +183,143 @@ final class ClientStore {
                 UserDefaults.standard.set(data, forKey: "installHistory")
             }
         } catch { errorMessage = error.localizedDescription }
+        #endif
     }
+
+    #if os(macOS)
+    /// Dossier d'installation des apps macOS.
+    nonisolated static let applicationsFolder = URL(fileURLWithPath: "/Applications", isDirectory: true)
+
+    /// Télécharge l'archive de l'app, la décompresse et la place dans /Applications (en remplaçant la version présente).
+    /// Retourne nil en cas de succès, sinon le message d'erreur (affiché dans une alerte si `reportsError`).
+    @discardableResult
+    func installMac(_ app: RemoteApp, reportsError: Bool = true) async -> String? {
+        guard downloadTask == nil else { return nil }
+        let id = UUID()
+        operationID = id
+        downloadingAppID = app.id
+        downloadedFile = nil
+        downloadMessage = "Téléchargement de \(app.name)…"
+        defer { if operationID == id { downloadingAppID = nil } }
+        do {
+            let base = try ServerAddress.parse(address)
+            var components = URLComponents(url: base.appending(path: "api/v1/apps/archive"), resolvingAgainstBaseURL: false)
+            components?.queryItems = [URLQueryItem(name: "app", value: app.id)]
+            guard let url = components?.url else { throw ClientError.invalidAddress }
+            let (archive, response) = try await session.download(from: url)
+            defer { try? FileManager.default.removeItem(at: archive) }
+            try check(response)
+            downloadMessage = "Installation de \(app.name) dans Applications…"
+            let installed = try await Self.install(archive: archive, bundleIdentifier: app.bundleIdentifier)
+            await reloadInstalledApps()
+            downloadedFile = installed
+            downloadMessage = "\(installed.lastPathComponent) \(app.version) (\(app.build)) est installée dans Applications."
+            return nil
+        } catch {
+            downloadMessage = "Installation échouée."
+            if reportsError { errorMessage = error.localizedDescription }
+            return error.localizedDescription
+        }
+    }
+
+    /// Dernier build de chaque app installée dont la version installée est plus ancienne que celle du serveur.
+    var outdatedInstalledApps: [RemoteApp] {
+        AppGroup.grouping(apps).map(\.latest).filter { installedApp($0)?.record.isOlder(than: $0) == true }
+    }
+
+    /// Avancement de la mise à jour groupée : app en cours (0-based) sur le total.
+    private(set) var updateBatch: (index: Int, total: Int)?
+
+    /// Télécharge et installe, l'une après l'autre, toutes les apps installées qui ont un build plus récent sur le serveur.
+    func updateInstalledApps() async {
+        guard updateBatch == nil, downloadTask == nil else { return }
+        let targets = outdatedInstalledApps
+        guard !targets.isEmpty else { return }
+        var failures: [String] = []
+        for (index, app) in targets.enumerated() {
+            updateBatch = (index, targets.count)
+            if let error = await installMac(app, reportsError: false) { failures.append("\(app.name) : \(error)") }
+        }
+        updateBatch = nil
+        let done = targets.count - failures.count
+        downloadMessage = failures.isEmpty
+            ? "\(done) app(s) mise(s) à jour dans Applications."
+            : "\(done) mise(s) à jour, \(failures.count) échec(s)."
+        if !failures.isEmpty {
+            downloadedFile = nil
+            errorMessage = failures.joined(separator: "\n")
+        }
+    }
+
+    /// Décompresse l'archive puis remplace l'app de /Applications. Hors du thread principal (ditto, copie).
+    nonisolated private static func install(archive: URL, bundleIdentifier: String) async throws -> URL {
+        let fileManager = FileManager.default
+        let work = fileManager.temporaryDirectory.appending(path: "ServeIPAClient-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try fileManager.createDirectory(at: work, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: work) }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        process.arguments = ["-x", "-k", archive.path, work.path]
+        let status: Int32 = try await withCheckedThrowingContinuation { continuation in
+            process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
+            do { try process.run() } catch { continuation.resume(throwing: error) }
+        }
+        guard status == 0,
+              let name = try fileManager.contentsOfDirectory(atPath: work.path).first(where: { $0.hasSuffix(".app") }) else {
+            throw ClientError.invalidDownload
+        }
+        let extracted = work.appending(path: name, directoryHint: .isDirectory)
+        // On n'installe que l'app annoncée par le serveur.
+        guard Bundle(url: extracted)?.bundleIdentifier == bundleIdentifier else { throw ClientError.invalidDownload }
+        let destination = applicationsFolder.appending(path: name, directoryHint: .isDirectory)
+        if fileManager.fileExists(atPath: destination.path) {
+            _ = try fileManager.replaceItemAt(destination, withItemAt: extracted)
+        } else {
+            try fileManager.moveItem(at: extracted, to: destination)
+        }
+        return destination
+    }
+
+    struct InstalledApp: Sendable {
+        let url: URL
+        let version: String
+        let build: String
+    }
+
+    func reloadInstalledApps() async {
+        installedApps = await Task.detached { Self.scanInstalledApps() }.value
+    }
+
+    /// Lit les apps de /Applications et ~/Applications. LaunchServices n'est pas fiable ici : il connaît toutes les copies
+    /// (DerivedData, exports) et n'est pas toujours à jour après un remplacement. On lit donc directement les Info.plist
+    /// (Bundle garderait en cache l'ancienne version d'un chemin remplacé).
+    nonisolated private static func scanInstalledApps() -> [String: InstalledApp] {
+        let fileManager = FileManager.default
+        var found: [String: InstalledApp] = [:]
+        for root in [URL(fileURLWithPath: "/Applications", isDirectory: true),
+                     fileManager.homeDirectoryForCurrentUser.appending(path: "Applications", directoryHint: .isDirectory)] {
+            let names = (try? fileManager.contentsOfDirectory(atPath: root.path)) ?? []
+            for name in names where name.hasSuffix(".app") {
+                let url = root.appending(path: name, directoryHint: .isDirectory)
+                guard let data = try? Data(contentsOf: url.appending(path: "Contents/Info.plist")),
+                      let info = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+                      let identifier = info["CFBundleIdentifier"] as? String,
+                      let build = info["CFBundleVersion"] as? String else { continue }
+                // En cas de doublon, /Applications (lu en premier) l'emporte.
+                if found[identifier] == nil {
+                    found[identifier] = InstalledApp(url: url, version: info["CFBundleShortVersionString"] as? String ?? "", build: build)
+                }
+            }
+        }
+        return found
+    }
+
+    /// Version réellement installée sur ce Mac.
+    func installedApp(_ app: RemoteApp) -> (url: URL, record: InstallRecord)? {
+        guard let installed = installedApps[app.bundleIdentifier] else { return nil }
+        return (installed.url, InstallRecord(appID: "", version: installed.version, build: installed.build, date: Date()))
+    }
+    #endif
 
     func pollInstallation() async {
         guard var pending else { return }
@@ -170,14 +344,14 @@ final class ClientStore {
             }
             // Detect only a transition from absent to available. An existing app proves no update.
             if pending.detectionSupported, !pending.wasDetectable,
-               let url = pending.app.launchURL, UIApplication.shared.canOpenURL(url) {
+               let url = pending.app.launchURL, Platform.canOpen(url) {
                 installMessage = "L’app est maintenant ouvrable. La version installée n’est pas vérifiable."
                 if autoOpen, !pending.didAutoOpen, progress.state == "transferred",
-                   UIApplication.shared.applicationState == .active {
+                   Platform.isActive {
                     pending.didAutoOpen = true
                     self.pending = pending
                     persistPending()
-                    _ = await UIApplication.shared.open(url)
+                    _ = await Platform.open(url)
                 }
             }
         } catch {
@@ -229,11 +403,28 @@ final class ClientStore {
         if finished { await refresh() }
     }
 
+    /// Vrai si le schéma d'URL de l'app est déclaré dans ce client et qu'une app l'ouvre sur cet appareil.
+    /// Ne prouve ni l'identité ni la version de l'app installée.
+    func isOpenable(_ app: RemoteApp) -> Bool {
+        #if os(macOS)
+        return installedApp(app) != nil
+        #else
+        guard let url = app.launchURL, let scheme = url.scheme else { return false }
+        let declared = Bundle.main.object(forInfoDictionaryKey: "LSApplicationQueriesSchemes") as? [String] ?? []
+        return declared.contains(scheme) && Platform.canOpen(url)
+        #endif
+    }
+
     func openApp(_ app: RemoteApp) async {
+        #if os(macOS)
+        if let installed = installedApp(app) { NSWorkspace.shared.open(installed.url) }
+        return
+        #else
         guard let url = app.launchURL else { return }
-        if !(await UIApplication.shared.open(url)) {
-            errorMessage = "iOS ne peut pas ouvrir cette app. Elle est peut-être encore en cours d’installation ou son schéma d’URL ne permet pas son ouverture."
+        if !(await Platform.open(url)) {
+            errorMessage = "Cet appareil ne peut pas ouvrir cette app. Elle est peut-être encore en cours d’installation ou son schéma d’URL ne permet pas son ouverture."
         }
+        #endif
     }
 
     func download(_ app: RemoteApp) {
