@@ -165,15 +165,19 @@ private struct PendingUpdate: Codable {
 }
 
 extension IPAStore {
-    func selfUpdatePlan() async throws -> SelfUpdatePlan {
+    /// `reusesLocation` : la détection périodique se contente de l'emplacement retenu du projet ; une mise à jour
+    /// le recherche à nouveau.
+    func selfUpdatePlan(reusesLocation: Bool = false) async throws -> SelfUpdatePlan {
         guard let folderURL, let devRoot = effectiveProjectsFolder else {
             throw IPARebuilder.RebuildError.unreadableFolder("—")
         }
         let bundleID = Bundle.main.bundleIdentifier ?? ""
         let running = Int(AppBuildInfo.current.build) ?? 0
         let (project, projectNumber, recorded, changed) = try await Task.detached {
-            let project = try IPARebuilder.findProject(bundleIdentifier: bundleID, appName: "ServeIPA",
-                                                       devRoot: devRoot, ipaRoot: folderURL)
+            let known = reusesLocation ? ProjectLocator.find(bundleIdentifier: bundleID, appName: "ServeIPA",
+                                                            devRoot: devRoot, ipaRoot: folderURL) : nil
+            let project = try known ?? IPARebuilder.findProject(bundleIdentifier: bundleID, appName: "ServeIPA",
+                                                                devRoot: devRoot, ipaRoot: folderURL)
             let folder = project.deletingLastPathComponent()
             return (project, ProjectBuildNumber.read(project: project) ?? 0, ProjectBuildNumber.recorded(in: folder),
                     SelfUpdater.sourcesChanged(in: folder))
@@ -206,7 +210,7 @@ extension IPAStore {
     /// Recalcule la mise à jour disponible, signalée aux clients.
     func checkForServerUpdate() async {
         guard !isBusy, !isInstallingUpdate else { return }
-        let detail: String? = switch try? await selfUpdatePlan() {
+        let detail: String? = switch try? await selfUpdatePlan(reusesLocation: true) {
         case .install(_, let build): String(localized: "Build \(build) prêt à installer.")
         case .compile(_, let reason): reason
         case .upToDate, nil: nil

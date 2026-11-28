@@ -258,7 +258,8 @@ struct ContentView: View {
                           commitMessage = "Build \(app.projectBuild ?? Int(app.build) ?? 0)"
                           gitRequest = (app, push)
                       },
-                      commitDisabled: !store.isConnected || store.committingAppIDs.contains(app.id),
+                      commitDisabled: !store.isConnected || store.committingAppIDs.contains(app.id)
+                          || store.isCompilationBlocked(app),
                       delete: { appToDelete = app })
             #if os(macOS)
             // Double-clic : ouvre l'app installée dans Applications (pas le build du serveur).

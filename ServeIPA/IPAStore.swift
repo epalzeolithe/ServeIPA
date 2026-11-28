@@ -398,20 +398,36 @@ final class IPAStore {
         guard !isRunningGitAction, !isBusy else {
             return GitActionResult(succeeded: false, message: "Le Mac est occupé (compilation ou autre action git).")
         }
+        let blocked = GitActionResult(succeeded: false,
+                                      message: "Un prompt rClaude est en cours sur ce projet : commit et push impossibles.")
+        guard !isCompilationBlocked(build) else { return blocked }
         guard let folderURL, let devRoot = effectiveProjectsFolder else {
             return GitActionResult(succeeded: false, message: "Le dossier des projets n’est pas choisi sur le Mac.")
         }
         isRunningGitAction = true
         defer { isRunningGitAction = false }
-        let result = await Task.detached {
-            do {
-                let project = try IPARebuilder.findProject(bundleIdentifier: build.bundleIdentifier, appName: build.name,
-                                                           devRoot: devRoot, ipaRoot: folderURL)
-                return GitActions.commit(folder: project.deletingLastPathComponent(), message: message, push: push)
-            } catch {
-                return GitActionResult(succeeded: false, message: error.localizedDescription)
+        let result: GitActionResult
+        do {
+            let project = try await Task.detached {
+                try IPARebuilder.findProject(bundleIdentifier: build.bundleIdentifier, appName: build.name,
+                                             devRoot: devRoot, ipaRoot: folderURL)
+            }.value
+            let folder = project.deletingLastPathComponent()
+            // Le prompt peut porter le nom du projet ou de son dossier, et non celui de l'app. Relevé juste avant git.
+            let prompts = await Task.detached { PromptActivity.projects(in: PromptActivity.commands()) }.value
+            if PromptActivity.blocksCompilation(
+                prompts, names: [build.name, build.displayName, folder.lastPathComponent,
+                                 project.deletingPathExtension().lastPathComponent],
+                bundleIdentifier: build.bundleIdentifier) {
+                result = blocked
+            } else {
+                result = await Task.detached {
+                    GitActions.commit(folder: folder, message: message, push: push)
+                }.value
             }
-        }.value
+        } catch {
+            result = GitActionResult(succeeded: false, message: error.localizedDescription)
+        }
         // Les dates et numéros de commit et de push sont relus sans attendre.
         lastGitRead = .distantPast
         Task { await updateNewerProjectBuilds() }
@@ -448,8 +464,8 @@ final class IPAStore {
             var newer: [String: Int] = [:]
             var projects: [String: URL] = [:]
             for build in latest {
-                guard let project = try? IPARebuilder.findProject(bundleIdentifier: build.bundleIdentifier, appName: build.name,
-                                                                  devRoot: devRoot, ipaRoot: folderURL) else { continue }
+                guard let project = ProjectLocator.find(bundleIdentifier: build.bundleIdentifier, appName: build.name,
+                                                        devRoot: devRoot, ipaRoot: folderURL) else { continue }
                 projects[build.id] = project
                 guard let released = Int(build.build) else { continue }
                 let current = projectBuilds[project] ?? ProjectBuildNumber.read(project: project)

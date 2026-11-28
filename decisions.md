@@ -24,7 +24,7 @@
 - Ouverture manuelle via un schéma d’URL déclaré par l’IPA. Aucun lancement par bundle identifier via API privée.
 - Ouverture automatique facultative, au premier plan uniquement, lorsque le transfert est terminé ET qu’un schéma autorisé passe de non disponible à disponible. Ne pas l’utiliser pour une mise à jour d’une app déjà présente. Un schéma peut être partagé entre apps ; la disponibilité n’est pas une attestation d’identité ni de version.
 - `Configuration/Client-Info.plist` contient les schémas interrogés. Avec le SDK iOS 27, Apple limite LSApplicationQueriesSchemes à 25 entrées. Ajouter les schémas nécessaires puis recompiler le client.
-- IPA existants inspectés : iMetar déclare `imetar` (activé dans le client). rSSH déclare `rssh` (activé dans le client le 28/11/2026). iABView déclare `iabview` (activé dans le client le 28/11/2026). FlightWall et NZBPad ne déclarent aucun schéma ; ajouter CFBundleURLTypes dans leurs projets puis produire de nouveaux IPA pour permettre leur ouverture depuis ServeIPAClient.
+- IPA existants inspectés : iMetar déclare `imetar` (activé dans le client). rSSH déclare `rssh` (activé dans le client le 28/11/2026). iABView déclare `iabview` (activé dans le client le 28/11/2026). NZBPad déclare `nzbpad` (activé dans le client le 28/11/2026). FlightWall ne déclare aucun schéma ; ajouter CFBundleURLTypes dans son projet puis produire un nouvel IPA pour permettre son ouverture depuis ServeIPAClient.
 - Le suivi OTA est persisté localement et repris au retour dans le client. Le téléchargement de fichier utilise une session standard ; une reprise garantie après fermeture forcée nécessiterait une URLSession de fond.
 
 ## 2026-11-26 — Lien d'installation `serveipa://`
@@ -148,7 +148,7 @@
 
 - Menu « … » du dernier build : « Stage et commit… » et « Stage, commit et push… », avec saisie du message.
 - `POST /api/v1/git?app=…&message=…&push=0|1` : `git add -A` et commit limités au dossier du projet, puis `git push` sur la branche courante. Sans changement, le push est tout de même tenté. Aucune demande de mot de passe possible ; chaque commande est interrompue après 90 s.
-- Refusé pendant une compilation. Autorisé pendant un prompt rClaude. Comme les autres routes, sans authentification propre : les ACL du tailnet sont le seul contrôle d'accès.
+- Refusé pendant une compilation et pendant un prompt rClaude sur le projet (menu grisé, contrôle refait par le serveur juste avant git ; ServeIPA et son client se bloquent mutuellement). Comme les autres routes, sans authentification propre : les ACL du tailnet sont le seul contrôle d'accès.
 
 ## 2026-11-28 — La baguette magique commite et pousse
 
@@ -158,3 +158,7 @@
 ## 2026-11-28 — Client en attente pendant la mise à jour du serveur
 
 - Tant que le serveur se met à jour (en file ou en cours), le client ne peut pas être installé : bandeau et bouton Installer grisés, mise à jour groupée et liens refusés pour lui. La compilation reste possible.
+
+## 2026-11-28 — Emplacements des projets mémorisés
+
+- La détection des builds plus récents réutilise l'emplacement trouvé (5 min ; 1 min pour une app sans projet ; recherche immédiate si le projet a disparu). Recompilation, commit et push refont toujours la recherche.

@@ -479,6 +479,12 @@ final class ClientStore {
         }
         guard committingAppIDs.insert(app.id).inserted else { return }
         defer { committingAppIDs.remove(app.id) }
+        // Un prompt a pu démarrer pendant la saisie du message.
+        await pollRebuild()
+        guard !isCompilationBlocked(app) else {
+            errorMessage = "rClaude exécute un prompt sur « \(app.name) » : commit et push indisponibles."
+            return
+        }
         do {
             let base = try ServerAddress.parse(address)
             var components = URLComponents(url: base.appending(path: "api/v1/git"), resolvingAgainstBaseURL: false)
