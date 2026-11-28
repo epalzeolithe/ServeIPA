@@ -11,6 +11,8 @@ enum IPARebuilder {
         case ipaMissing
         case macAppMissing
         case platformUnsupported(String, String)
+        case timedOut(step: String, minutes: Int)
+        case promptRunning(String)
 
         var errorDescription: String? {
             switch self {
@@ -26,6 +28,10 @@ enum IPARebuilder {
                 String(localized: "« \(scheme) » ne prend pas en charge \(platform).")
             case .macAppMissing:
                 String(localized: "L’export macOS s’est terminé sans produire d’app.")
+            case .promptRunning(let app):
+                String(localized: "Un prompt rClaude est en cours sur « \(app) » : compilation impossible.")
+            case .timedOut(let step, let minutes):
+                String(localized: "L’étape « \(step) » a dépassé \(minutes) minutes et a été interrompue.")
             case .ipaMissing:
                 String(localized: "L’export s’est terminé sans produire d’IPA.")
             }
@@ -34,7 +40,8 @@ enum IPARebuilder {
 
     /// Recompile et exporte l'IPA (iOS) ou l'app (macOS) ; retourne le dossier d'export créé dans `ipaRoot`.
     /// Si `project` est fourni (choisi par l'utilisateur), la recherche dans `devRoot` est sautée.
-    nonisolated static func rebuild(
+    /// Annuler la tâche appelante interrompt xcodebuild. Sa sortie est ajoutée à `log` s'il est fourni.
+    @concurrent nonisolated static func rebuild(
         bundleIdentifier: String?,
         appName: String,
         project projectOverride: URL? = nil,
@@ -42,6 +49,7 @@ enum IPARebuilder {
         devRoot: URL,
         ipaRoot: URL,
         platform: IPABuild.Platform,
+        log: URL? = nil,
         progress: @Sendable (String) -> Void
     ) async throws -> URL {
         progress(String(localized: "Recherche du projet…"))
@@ -69,6 +77,8 @@ enum IPARebuilder {
             throw RebuildError.platformUnsupported(scheme, platform.rawValue)
         }
 
+        try Task.checkCancellation()
+
         let stamp = DateFormatter()
         stamp.locale = Locale(identifier: "en_US_POSIX")
         stamp.dateFormat = "yyyy-MM-dd HH-mm-ss"
@@ -78,7 +88,8 @@ enum IPARebuilder {
         do {
             try await archiveAndExport(project: project, scheme: scheme,
                                        destination: platform == .macOS ? "generic/platform=macOS" : "generic/platform=iOS",
-                                       label: platform.rawValue, work: work, exportPath: exportDirectory, progress: progress)
+                                       label: platform.rawValue, work: work, exportPath: exportDirectory, log: log,
+                                       progress: progress)
             let exported = (try? FileManager.default.contentsOfDirectory(atPath: exportDirectory.path)) ?? []
             switch platform {
             case .iOS:
@@ -101,17 +112,20 @@ enum IPARebuilder {
         label: String,
         work: URL,
         exportPath: URL,
+        log: URL?,
         progress: @Sendable (String) -> Void
     ) async throws {
         let archive = work.appending(path: "\(scheme)-\(label).xcarchive")
         progress(String(localized: "Compilation \(label) (Release)…"))
-        try await run(step: String(localized: "archive \(label)"), log: work.appending(path: "archive-\(label).log"), arguments: [
+        try await run(step: String(localized: "archive \(label)"), log: log ?? work.appending(path: "archive-\(label).log"), arguments: [
             "-project", project.path,
             "-scheme", scheme,
             "-configuration", "Release",
             "-destination", destination,
             "-archivePath", archive.path,
             "-allowProvisioningUpdates",
+            // Sans approbation interactive, xcodebuild refuse les plug-ins de paquets (ex. SwiftTerm dans rSSH).
+            "-skipPackagePluginValidation",
             "archive"
         ])
 
@@ -127,7 +141,7 @@ enum IPARebuilder {
         try PropertyListSerialization.data(fromPropertyList: options, format: .xml, options: 0).write(to: optionsURL)
 
         progress(String(localized: "Export de l’archive \(label)…"))
-        try await run(step: String(localized: "export \(label)"), log: work.appending(path: "export-\(label).log"), arguments: [
+        try await run(step: String(localized: "export \(label)"), log: log ?? work.appending(path: "export-\(label).log"), arguments: [
             "-exportArchive",
             "-archivePath", archive.path,
             "-exportPath", exportPath.path,
@@ -231,25 +245,91 @@ enum IPARebuilder {
         return (info["ApplicationProperties"] as? [String: Any])?["Team"] as? String
     }
 
-    /// Lance xcodebuild en écrivant sa sortie dans `log` ; en cas d'échec, remonte les dernières erreurs.
+    /// Durée maximale d'une étape xcodebuild.
+    nonisolated private static let stepLimitMinutes = 45
+
+    /// Lance xcodebuild en ajoutant sa sortie à `log` ; en cas d'échec, remonte les dernières erreurs.
     nonisolated private static func run(step: String, log: URL, arguments: [String]) async throws {
-        FileManager.default.createFile(atPath: log.path, contents: nil)
+        try Task.checkCancellation()
+        try FileManager.default.createDirectory(at: log.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: log.path) {
+            FileManager.default.createFile(atPath: log.path, contents: nil)
+        }
         let handle = try FileHandle(forWritingTo: log)
         defer { try? handle.close() }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcodebuild")
-        process.arguments = arguments
-        process.standardOutput = handle
-        process.standardError = handle
-        let status: Int32 = try await withCheckedThrowingContinuation { continuation in
-            process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
-            do { try process.run() } catch { continuation.resume(throwing: error) }
+        // Les erreurs remontées ne sont cherchées que dans la sortie de cette étape.
+        let start = try handle.seekToEnd()
+        let running = RunningProcess(executable: URL(fileURLWithPath: "/usr/bin/xcodebuild"),
+                                     arguments: arguments, output: handle)
+        let watchdog = Task {
+            try await Task.sleep(for: .seconds(stepLimitMinutes * 60))
+            running.stop(timedOut: true)
         }
+        defer { watchdog.cancel() }
+        let status = try await withTaskCancellationHandler {
+            try await running.run()
+        } onCancel: {
+            running.stop(timedOut: false)
+        }
+        if running.timedOut { throw RebuildError.timedOut(step: step, minutes: stepLimitMinutes) }
+        try Task.checkCancellation()
         guard status == 0 else {
-            let lines = ((try? String(contentsOf: log, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+            var output = Data()
+            if let reader = try? FileHandle(forReadingFrom: log) {
+                try? reader.seek(toOffset: start)
+                output = (try? reader.readToEnd()) ?? Data()
+                try? reader.close()
+            }
+            let lines = String(decoding: output, as: UTF8.self).split(separator: "\n").map(String.init)
             let errors = lines.filter { $0.contains("error:") }
             let details = (errors.isEmpty ? lines.suffix(8) : errors.suffix(5)).joined(separator: "\n")
             throw RebuildError.failed(step: step, details: details)
+        }
+    }
+}
+
+/// Processus interruptible : SIGTERM, puis SIGKILL s'il est toujours là 10 secondes plus tard.
+nonisolated final class RunningProcess: @unchecked Sendable {
+    private let process = Process()
+    private let lock = NSLock()
+    private var stopped = false
+    private var expired = false
+
+    var timedOut: Bool { lock.withLock { expired } }
+
+    init(executable: URL, arguments: [String], output: FileHandle) {
+        process.executableURL = executable
+        process.arguments = arguments
+        process.standardOutput = output
+        process.standardError = output
+    }
+
+    /// Code de sortie. Lève `CancellationError` si l'arrêt a été demandé avant le lancement.
+    func run() async throws -> Int32 {
+        try await withCheckedThrowingContinuation { continuation in
+            process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
+            do {
+                try lock.withLock {
+                    guard !stopped else { throw CancellationError() }
+                    try process.run()
+                }
+            } catch {
+                process.terminationHandler = nil
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    func stop(timedOut: Bool) {
+        lock.withLock {
+            guard !stopped else { return }
+            stopped = true
+            guard process.isRunning else { return }
+            expired = timedOut
+            process.terminate()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 10) { [self] in
+                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            }
         }
     }
 }

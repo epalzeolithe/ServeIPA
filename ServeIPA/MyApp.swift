@@ -1,17 +1,25 @@
 import AppKit
 import SwiftUI
 
+/// Possède le magasin et lance le serveur : sa durée de vie ne dépend d'aucune fenêtre.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let store = IPAStore()
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        Task { await store.startIfNeeded() }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+}
+
 @main
 struct ServeIPAApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @State private var store = IPAStore()
+    private var store: IPAStore { appDelegate.store }
 
     var body: some Scene {
         WindowGroup("ServeIPA", id: "main") {
             ContentView(store: store)
-                .task {
-                    await store.startIfNeeded()
-                }
         }
         .defaultSize(width: 820, height: 560)
 
@@ -22,16 +30,6 @@ struct ServeIPAApp: App {
         Settings {
             ServeIPASettingsView(store: store)
         }
-    }
-}
-
-private final class AppDelegate: NSObject, NSApplicationDelegate {
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        guard let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
-              let icon = NSImage(contentsOf: iconURL) else {
-            return
-        }
-        NSApplication.shared.applicationIconImage = icon
     }
 }
 
@@ -81,6 +79,7 @@ private struct ServerMenu: View {
             openSettings()
             NSApplication.shared.activate()
         }
+        Toggle("Masquer l’icône du Dock", isOn: $store.hideDockIcon)
 
         Divider()
 
@@ -89,7 +88,7 @@ private struct ServerMenu: View {
             NSApplication.shared.activate()
             Task { await store.updateServeIPA() }
         }
-        .disabled(store.folderURL == nil || store.rebuildingBundleID != nil)
+        .disabled(store.folderURL == nil || store.rebuildingBundleID != nil || store.isSelfUpdateBlocked)
 
         Button("Quitter ServeIPA") {
             NSApplication.shared.terminate(nil)

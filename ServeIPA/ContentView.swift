@@ -5,7 +5,7 @@ struct ContentView: View {
     @Bindable var store: IPAStore
     @State private var buildToDelete: IPABuild?
     @State private var showsCleanConfirmation = false
-    @State private var platform: IPABuild.Platform = .iOS
+    @State private var platform: IPABuild.Platform = .macOS
     @State private var showsProjectScan = false
     @State private var searchText = ""
 
@@ -50,9 +50,12 @@ struct ContentView: View {
                 selection: $store.selectedBuildID,
                 oldBuildCount: store.oldBuildCount,
                 newerProjectBuilds: store.newerProjectBuilds,
+                activePromptProjects: store.activePromptProjects,
+                installRevision: store.installRevision,
                 rebuildingBundleID: store.rebuildingBundleID,
                 rebuildStatus: store.rebuildStatus,
                 rebuildAction: { build in Task { await store.rebuild(build) } },
+                installAction: { build in Task { await store.installInApplications(build) } },
                 deleteAction: { buildToDelete = $0 },
                 cleanAction: { showsCleanConfirmation = true }
             )
@@ -89,8 +92,9 @@ struct ContentView: View {
                 Button("Mettre à jour et nettoyer", systemImage: "wand.and.sparkles") {
                     showsCleanConfirmation = true
                 }
-                .help("Recompiler les apps dont le projet est plus récent, et supprimer les anciennes versions")
-                .disabled((store.oldBuildCount == 0 && store.outdatedBuilds.isEmpty) || store.isScanning
+                .help("Recompiler les apps dont le projet est plus récent, supprimer les anciennes versions, puis copier les releases manquantes dans /Applications")
+                .disabled((store.oldBuildCount == 0 && store.outdatedBuilds.isEmpty && store.missingInstallBuilds.isEmpty)
+                          || store.isScanning
                           || store.rebuildingBundleID != nil)
             }
         }
@@ -105,29 +109,52 @@ struct ContentView: View {
         } message: {
             Text(store.rebuildError ?? "")
         }
+        .alert("Installation dans /Applications", isPresented: Binding(
+            get: { store.installMessage != nil },
+            set: { if !$0 { store.installMessage = nil } }
+        )) {
+            Button("OK") { store.installMessage = nil }
+        } message: {
+            Text(store.installMessage ?? "")
+        }
         .confirmationDialog(
-            store.outdatedBuilds.isEmpty ? "Supprimer toutes les anciennes versions ?" : "Mettre à jour et nettoyer ?",
+            store.outdatedBuilds.isEmpty && store.oldBuildCount == 0
+                ? "Installer les releases manquantes ?"
+                : store.outdatedBuilds.isEmpty ? "Supprimer toutes les anciennes versions ?" : "Mettre à jour et nettoyer ?",
             isPresented: $showsCleanConfirmation,
             titleVisibility: .visible
         ) {
             let outdated = store.outdatedBuilds.count
             let old = store.oldBuildCount
+            let missing = store.missingInstallBuilds.count
             if outdated > 0 {
-                Button(old > 0 ? "Recompiler \(outdated) app(s) puis nettoyer" : "Recompiler \(outdated) app(s)") {
-                    Task { await store.updateOutdatedBuilds(thenClean: old > 0) }
+                // Le nettoyage est toujours fait après recompilation : le nouveau build rend l'ancienne release obsolète.
+                Button("Recompiler \(outdated) app(s) puis nettoyer") {
+                    Task { await store.runMaintenance(rebuild: true, clean: true) }
                 }
             }
             if old > 0 {
                 Button("Supprimer \(old) ancien(s) build(s)", role: .destructive) {
-                    Task { await store.cleanOldVersions() }
+                    Task { await store.runMaintenance(rebuild: false, clean: true) }
+                }
+            }
+            if outdated == 0 && old == 0 && missing > 0 {
+                Button("Copier \(missing) app(s) dans /Applications") {
+                    Task { await store.runMaintenance(rebuild: false, clean: false) }
                 }
             }
         } message: {
             let names = store.outdatedBuilds.map { "\($0.name) (\($0.platform.rawValue))" }.formatted()
-            if store.outdatedBuilds.isEmpty {
-                Text("Seul le build le plus récent de chaque app est conservé. Les dossiers des autres sont supprimés définitivement du disque.")
+            let missing = store.missingInstallBuilds.map(\.name).formatted()
+            let installNote = store.missingInstallBuilds.isEmpty
+                ? ""
+                : String(localized: " Les releases macOS manquantes dans /Applications seront ensuite copiées : \(missing).")
+            if store.outdatedBuilds.isEmpty && store.oldBuildCount == 0 {
+                Text("Releases macOS absentes ou différentes dans /Applications : \(missing).")
+            } else if store.outdatedBuilds.isEmpty {
+                Text("Seul le build le plus récent de chaque app est conservé. Les dossiers des autres sont supprimés définitivement du disque.\(installNote)")
             } else {
-                Text("Projets plus récents que leur release : \(names). Ils seront recompilés l’un après l’autre. Le nettoyage ne conserve ensuite que le build le plus récent de chaque app ; les autres dossiers sont supprimés définitivement.")
+                Text("Projets plus récents que leur release : \(names). Ils seront recompilés l’un après l’autre. Le nettoyage ne conserve ensuite que le build le plus récent de chaque app ; les autres dossiers sont supprimés définitivement.\(installNote)")
             }
         }
         .confirmationDialog(
@@ -226,9 +253,12 @@ private struct BuildList: View {
     let oldBuildCount: Int
     /// Numéro de build du projet Xcode, pour les releases dont le projet est plus récent.
     let newerProjectBuilds: [String: Int]
+    let activePromptProjects: [String]
+    let installRevision: Int
     let rebuildingBundleID: String?
     let rebuildStatus: String?
     let rebuildAction: (IPABuild) -> Void
+    let installAction: (IPABuild) -> Void
     let deleteAction: (IPABuild) -> Void
     let cleanAction: () -> Void
     @State private var expandedGroups: Set<String> = []
@@ -247,9 +277,18 @@ private struct BuildList: View {
         NSWorkspace.shared.openApplication(at: build.fileURL, configuration: NSWorkspace.OpenConfiguration())
     }
 
+    private func isCompilationBlocked(_ build: IPABuild) -> Bool {
+        PromptActivity.blocksCompilation(activePromptProjects, names: [build.name, build.displayName],
+                                         bundleIdentifier: build.bundleIdentifier)
+    }
+
     private func row(for build: IPABuild, isLatest: Bool, olderCount: Int = 0) -> some View {
         BuildRow(build: build, isLatest: isLatest, olderCount: olderCount,
-                 newerProjectBuild: isLatest ? newerProjectBuilds[build.id] : nil)
+                 newerProjectBuild: isLatest ? newerProjectBuilds[build.id] : nil,
+                 installRevision: installRevision,
+                 isRunningPrompt: isLatest && PromptActivity.concerns(
+                    activePromptProjects, names: [build.name, build.displayName],
+                    bundleIdentifier: build.bundleIdentifier))
             .tag(build.id)
             .simultaneousGesture(TapGesture(count: 2).onEnded {
                 if build.platform == .macOS { launch(build) }
@@ -262,12 +301,13 @@ private struct BuildList: View {
             .contextMenu {
                 if build.platform == .macOS {
                     Button("Ouvrir l’app", systemImage: "arrow.up.forward.app") { launch(build) }
+                    Button("Copier dans /Applications", systemImage: "square.and.arrow.down") { installAction(build) }
                     Divider()
                 }
                 Button(build.platform == .macOS ? "Recompiler et exporter l’app" : "Recompiler et exporter l’IPA", systemImage: "hammer") {
                     rebuildAction(build)
                 }
-                .disabled(rebuildingBundleID != nil)
+                .disabled(rebuildingBundleID != nil || isCompilationBlocked(build))
                 Button("Afficher dans le Finder", systemImage: "folder") {
                     NSWorkspace.shared.activateFileViewerSelecting([build.fileURL])
                 }
@@ -317,7 +357,7 @@ private struct BuildList: View {
                     }
                     Divider()
                     HStack(spacing: 4) {
-                        Text("\(groups.count) apps · \(builds.count) builds")
+                        Text("\(groups.count) apps")
                             .foregroundStyle(.secondary)
                         Spacer()
                         Text("ServeIPA \(AppBuildInfo.current.summary)")
@@ -329,7 +369,12 @@ private struct BuildList: View {
                             Button("Recompiler", systemImage: "hammer") {
                                 rebuildAction(selected)
                             }
-                            .disabled(rebuildingBundleID != nil)
+                            .disabled(rebuildingBundleID != nil || isCompilationBlocked(selected))
+                            if selected.platform == .macOS {
+                                Button("Copier dans /Applications", systemImage: "square.and.arrow.down") {
+                                    installAction(selected)
+                                }
+                            }
                             Button("Afficher dans le Finder", systemImage: "folder") {
                                 NSWorkspace.shared.activateFileViewerSelecting([selected.fileURL])
                             }
@@ -396,6 +441,10 @@ private struct BuildRow: View {
     let olderCount: Int
     /// Numéro de build du projet Xcode s'il est plus récent que cette release.
     var newerProjectBuild: Int?
+    /// Change après chaque installation dans /Applications pour forcer la relecture de l'app installée.
+    var installRevision = 0
+    /// rClaude exécute un prompt sur le projet de cette app.
+    var isRunningPrompt = false
 
     var body: some View {
         HStack(spacing: 10) {
@@ -412,6 +461,13 @@ private struct BuildRow: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .layoutPriority(1)
+                    if isInstalledInApplications {
+                        Image(systemName: "desktopcomputer")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .help("Cette release est identique à celle installée dans /Applications.")
+                            .accessibilityLabel("Identique à la version installée dans Applications")
+                    }
                     if let newerProjectBuild {
                         Label("Build \(newerProjectBuild)", systemImage: "arrow.up.circle.fill")
                             .font(.caption2.weight(.semibold))
@@ -423,6 +479,13 @@ private struct BuildRow: View {
                             .help("Le projet Xcode est au build \(newerProjectBuild), plus récent que cette release (\(build.build)). Recompilez pour l’exporter.")
                             .accessibilityLabel("Projet plus récent : build \(newerProjectBuild)")
                     }
+                    if isRunningPrompt {
+                        Image(systemName: "sparkles")
+                            .foregroundStyle(.orange)
+                            .symbolEffect(.pulse)
+                            .help("rClaude exécute un prompt sur ce projet")
+                            .accessibilityLabel("rClaude exécute un prompt sur ce projet")
+                    }
                 }
                 Text(details)
                     .font(.caption.monospacedDigit())
@@ -432,6 +495,11 @@ private struct BuildRow: View {
             Spacer(minLength: 0)
         }
         .padding(.vertical, 2)
+    }
+
+    /// Vrai si l'app de /Applications a le même identifiant, la même version et le même build que cette release macOS.
+    private var isInstalledInApplications: Bool {
+        IPAStore.isInstalledInApplications(build)
     }
 
     /// Date · taille · OS minimum · anciens builds · nom du dossier s'il diffère du nom de l'app.
@@ -454,7 +522,12 @@ private struct BuildRow: View {
 
     private static func shortDate(_ text: String) -> String {
         guard let date = inputFormat.date(from: text) else { return text }
-        return date.formatted(.dateTime.day(.twoDigits).month(.twoDigits).year(.twoDigits).hour().minute())
+        // « 25 nov 16:25 », avec l'année si ce n'est pas l'année en cours.
+        var style = Date.FormatStyle(locale: Locale(identifier: "fr_FR")).day().month(.abbreviated)
+        if !Calendar.current.isDate(date, equalTo: Date(), toGranularity: .year) { style = style.year() }
+        let day = date.formatted(style).replacingOccurrences(of: ".", with: "")
+        let time = Calendar.current.dateComponents([.hour, .minute], from: date)
+        return day + String(format: " %02d:%02d", time.hour ?? 0, time.minute ?? 0)
     }
 }
 
@@ -490,7 +563,7 @@ private struct BuildIconView: View {
         let platform = build.platform
         let data = await Task.detached {
             platform == .macOS
-                ? try? Data(contentsOf: url.appending(path: entry))
+                ? IPAMetadataReader.iconPNG(appURL: url, entry: entry)
                 : IPAMetadataReader.iconPNG(ipaURL: url, entry: entry)
         }.value
         guard let data, let loaded = NSImage(data: data) else { image = nil; return }
@@ -537,7 +610,12 @@ struct ServeIPASettingsView: View {
                 Button("Recompiler et relancer ServeIPA…") {
                     Task { await store.updateServeIPA() }
                 }
-                .disabled(store.folderURL == nil || store.rebuildingBundleID != nil)
+                .disabled(store.folderURL == nil || store.rebuildingBundleID != nil || store.isSelfUpdateBlocked)
+                if store.isSelfUpdateBlocked {
+                    Text("Prompt rClaude en cours sur le projet ServeIPA : mise à jour indisponible.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
                 if let status = store.rebuildStatus, store.rebuildingBundleID == "ServeIPA" {
                     HStack(spacing: 6) {
                         ProgressView().controlSize(.small)
@@ -559,6 +637,18 @@ struct ServeIPASettingsView: View {
                     )
                 )
                 Toggle("Démarrer automatiquement le serveur", isOn: $store.startServerAutomatically)
+            }
+            Section("Nightly build") {
+                Toggle("Nightly build", isOn: $store.nightlyBuild)
+                Text("Chaque nuit à 1 h, si le serveur tourne, ServeIPA recompile les apps dont le projet est plus récent, supprime les anciennes versions et copie les releases macOS dans /Applications.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section("Dock") {
+                Toggle("Masquer l’icône du Dock", isOn: $store.hideDockIcon)
+                Text("ServeIPA reste accessible depuis l’icône de la barre des menus.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section("Nettoyage") {
                 Picker("Builds conservés par app", selection: $store.keepBuildsPerApp) {

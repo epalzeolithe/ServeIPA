@@ -32,11 +32,17 @@ final class IPAStore {
         }
     }
 
-    private enum DefaultsKey {
+    enum DefaultsKey {
         static let folderBookmark = "ipaFolderBookmark"
         static let startServerAutomatically = "startServerAutomatically"
         static let keepBuildsPerApp = "keepBuildsPerApp"
         static let projectsBookmark = "projectsFolderBookmark"
+        static let hideDockIcon = "hideDockIcon"
+        static let nightlyBuild = "nightlyBuild"
+        static let lastNightlyRun = "lastNightlyRun"
+        static let startServerAfterUpdate = "startServerAfterUpdate"
+        static let pendingUpdate = "pendingUpdate"
+        static let jobHistory = "jobHistory"
     }
 
     var builds: [IPABuild] = []
@@ -46,11 +52,37 @@ final class IPAStore {
     var selectedBuildID: String?
     var folderURL: URL?
     var isScanning = false
+    /// Baguette magique en cours (manuelle, nightly ou demandée par un client).
+    private(set) var isRunningMaintenance = false
     /// Identifiant de bundle de l'app en cours de recompilation, son étape et la dernière erreur.
     var rebuildingBundleID: String?
     var rebuildStatus: String?
     var rebuildError: String?
-    private var currentJob: RebuildJob?
+    /// Résultat de la dernière installation dans /Applications.
+    var installMessage: String?
+    /// Apps non installées dans /Applications parce qu'elles sont restées ouvertes ou sont occupées.
+    private var postponedApps: [String] = []
+    /// Incrémenté après chaque copie dans /Applications, pour rafraîchir les badges « déjà installée ».
+    private(set) var installRevision = 0
+    var currentJob: RebuildJob?
+    /// Demandes des clients en attente, et la tâche qui les exécute l'une après l'autre.
+    var pendingJobs: [QueuedJob] = []
+    var queueTask: Task<Void, Never>?
+    var runningQueueKey: String?
+    /// Derniers jobs terminés, du plus récent au plus ancien.
+    var jobHistory: [RebuildJob] = UserDefaults.standard.data(forKey: DefaultsKey.jobHistory)
+        .flatMap { try? JSONDecoder().decode([RebuildJob].self, from: $0) } ?? []
+    /// Compilation en cours (annulable) et job dont l'annulation est demandée.
+    var activeBuild: Task<URL, Error>?
+    var cancelledJobID: String?
+    /// ServeIPA est sur le point de se remplacer : plus aucune demande n'est acceptée.
+    var isInstallingUpdate = false
+    /// Mise à jour de ServeIPA disponible (nil s'il est à jour).
+    var serverUpdateDetail: String?
+    /// Projets sur lesquels rClaude exécute un prompt en ce moment.
+    var activePromptProjects: [String] = []
+    private var lastUpdateCheck = Date.distantPast
+    private var hasStarted = false
     /// Dossier contenant les projets Xcode ; par défaut, le dossier parent des IPA.
     var projectsFolderURL: URL?
     /// Dossier réellement utilisé pour chercher les projets (choisi, sinon parent du dossier des IPA).
@@ -79,6 +111,29 @@ final class IPAStore {
         }
     }
 
+    /// Chaque nuit à 1 h, si le serveur tourne : recompile les apps dépassées, nettoie les anciennes
+    /// versions et copie les releases dans /Applications.
+    var nightlyBuild: Bool {
+        didSet {
+            UserDefaults.standard.set(nightlyBuild, forKey: DefaultsKey.nightlyBuild)
+        }
+    }
+
+    /// Masque l'icône du Dock (l'app reste accessible depuis la barre des menus).
+    var hideDockIcon: Bool {
+        didSet {
+            UserDefaults.standard.set(hideDockIcon, forKey: DefaultsKey.hideDockIcon)
+            applyDockIconVisibility()
+            if !hideDockIcon {
+                NSApplication.shared.activate()
+            }
+        }
+    }
+
+    private func applyDockIconVisibility() {
+        NSApplication.shared.setActivationPolicy(hideDockIcon ? .accessory : .regular)
+    }
+
     /// Nombre de builds conservés par app (identifiant de bundle). 0 = nettoyage désactivé.
     var keepBuildsPerApp: Int {
         didSet {
@@ -88,13 +143,19 @@ final class IPAStore {
     }
 
     let port: UInt16 = 8765
-    private var server: OTAServer?
+    var server: OTAServer?
     private var isAccessingSecurityScopedFolder = false
 
     init() {
-        UserDefaults.standard.register(defaults: [DefaultsKey.startServerAutomatically: true])
+        UserDefaults.standard.register(defaults: [DefaultsKey.startServerAutomatically: true,
+                                                  DefaultsKey.nightlyBuild: true])
+        nightlyBuild = UserDefaults.standard.bool(forKey: DefaultsKey.nightlyBuild)
         startServerAutomatically = UserDefaults.standard.bool(forKey: DefaultsKey.startServerAutomatically)
         keepBuildsPerApp = UserDefaults.standard.integer(forKey: DefaultsKey.keepBuildsPerApp)
+        hideDockIcon = UserDefaults.standard.bool(forKey: DefaultsKey.hideDockIcon)
+        if hideDockIcon {
+            applyDockIconVisibility()
+        }
         restoreFolder()
         restoreProjectsFolder()
     }
@@ -123,7 +184,7 @@ final class IPAStore {
         guard !isScanningProjects, let root = effectiveProjectsFolder else { return }
         isScanningProjects = true
         projectScanError = nil
-        projectAddStates = [:]
+        if !isAddingProjects { projectAddStates = [:] }
         defer {
             isScanningProjects = false
             projectScanProgress = nil
@@ -181,9 +242,21 @@ final class IPAStore {
 
     // MARK: Mise à jour de ServeIPA
 
+    /// Vrai si rClaude exécute un prompt sur le projet de ServeIPA : il ne se met alors pas à jour d'ici.
+    var isSelfUpdateBlocked: Bool {
+        PromptActivity.concerns(activePromptProjects, names: ["ServeIPA", "ServeIPAClient"],
+                                bundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+    }
+
+    /// Vrai si rClaude exécute un prompt sur le projet de ce build : il ne peut alors pas être compilé.
+    func isCompilationBlocked(_ build: IPABuild) -> Bool {
+        PromptActivity.blocksCompilation(activePromptProjects, names: [build.name, build.displayName],
+                                         bundleIdentifier: build.bundleIdentifier)
+    }
+
     /// Recompile ServeIPA depuis son projet (macOS, Release), puis le remplace et le relance.
     func updateServeIPA() async {
-        guard rebuildingBundleID == nil, !isAddingProjects else {
+        guard rebuildingBundleID == nil, !isAddingProjects, !isRunningMaintenance, pendingJobs.isEmpty else {
             rebuildError = String(localized: "Une compilation est déjà en cours. Réessayez quand elle sera terminée.")
             return
         }
@@ -202,26 +275,34 @@ final class IPAStore {
         alert.addButton(withTitle: String(localized: "Mettre à jour"))
         alert.addButton(withTitle: String(localized: "Annuler"))
         guard alert.runModal() == .alertFirstButtonReturn else { return }
+        // Un prompt a pu démarrer pendant la confirmation.
+        guard !isSelfUpdateBlocked else {
+            rebuildError = String(localized: "Prompt rClaude en cours sur le projet ServeIPA : mise à jour indisponible.")
+            return
+        }
 
         let bundleID = Bundle.main.bundleIdentifier ?? ""
+        let jobID = UUID().uuidString
         rebuildingBundleID = "ServeIPA"
         rebuildStatus = String(localized: "Recherche du projet…")
         rebuildError = nil
+        beginJob(RebuildJob(id: jobID, app: "ServeIPA", platform: IPABuild.Platform.macOS.rawValue, state: "running",
+                            step: String(localized: "Préparation…"), error: nil, startedAt: Date(), kind: "update"))
         do {
             let project = try await Task.detached {
                 try IPARebuilder.findProject(bundleIdentifier: bundleID, appName: "ServeIPA", devRoot: devRoot, ipaRoot: folderURL)
             }.value
-            let export = try await IPARebuilder.rebuild(
-                bundleIdentifier: bundleID, appName: "ServeIPA", project: project,
-                devRoot: devRoot, ipaRoot: folderURL, platform: .macOS,
-                progress: { message in Task { @MainActor in self.rebuildStatus = message } }
-            )
+            let export = try await compileServeIPA(project: project, jobID: jobID)
             let app = try SelfUpdater.exportedApp(in: export)
             rebuildStatus = String(localized: "Installation et relance…")
-            await stopServer()
-            try SelfUpdater.installAndRelaunch(app, to: destination)
+            try await relaunch(with: app, to: destination, jobID: jobID)
         } catch {
-            rebuildError = error.localizedDescription
+            let cancelled = cancelledJobID == jobID
+            if !cancelled { rebuildError = error.localizedDescription }
+            updateJob {
+                $0.state = cancelled ? "cancelled" : "failed"
+                $0.error = cancelled ? nil : error.localizedDescription
+            }
             rebuildingBundleID = nil
             rebuildStatus = nil
             await refresh()
@@ -303,11 +384,59 @@ final class IPAStore {
 
     /// Numéro de build du projet, par identifiant de build, pour les releases dont le projet est plus récent.
     var newerProjectBuilds: [String: Int] = [:]
+    /// Dates git du projet, par identifiant du build le plus récent de chaque app.
+    private var projectGitDates: [String: ProjectGitDates] = [:]
+    private var projectBuildsTask: Task<Void, Never>?
+    private var isReadingGitDates = false
+    private var isRunningGitAction = false
+    private var lastGitRead = Date.distantPast
+    private var gitDatesReleases: Set<String> = []
 
-    /// Compare le build le plus récent de chaque app au numéro de build courant de son projet Xcode.
+    /// Stage et commit (puis push) du projet d'une app, à la demande d'un client. Refusé pendant une compilation,
+    /// qui écrit dans les projets, ou une autre action git.
+    func runGitAction(_ build: IPABuild, message: String, push: Bool) async -> GitActionResult {
+        guard !isRunningGitAction, !isBusy else {
+            return GitActionResult(succeeded: false, message: "Le Mac est occupé (compilation ou autre action git).")
+        }
+        guard let folderURL, let devRoot = effectiveProjectsFolder else {
+            return GitActionResult(succeeded: false, message: "Le dossier des projets n’est pas choisi sur le Mac.")
+        }
+        isRunningGitAction = true
+        defer { isRunningGitAction = false }
+        let result = await Task.detached {
+            do {
+                let project = try IPARebuilder.findProject(bundleIdentifier: build.bundleIdentifier, appName: build.name,
+                                                           devRoot: devRoot, ipaRoot: folderURL)
+                return GitActions.commit(folder: project.deletingLastPathComponent(), message: message, push: push)
+            } catch {
+                return GitActionResult(succeeded: false, message: error.localizedDescription)
+            }
+        }.value
+        // Les dates et numéros de commit et de push sont relus sans attendre.
+        lastGitRead = .distantPast
+        Task { await updateNewerProjectBuilds() }
+        return result
+    }
+
+    /// Compare le build le plus récent de chaque app au numéro de build courant de son projet Xcode. Une demande
+    /// faite pendant un calcul attend celui-ci au lieu d'en lancer un second.
     func updateNewerProjectBuilds() async {
+        if let projectBuildsTask {
+            await projectBuildsTask.value
+            return
+        }
+        let task = Task { await computeNewerProjectBuilds() }
+        projectBuildsTask = task
+        await task.value
+        projectBuildsTask = nil
+    }
+
+    private func computeNewerProjectBuilds() async {
         guard let folderURL, let devRoot = effectiveProjectsFolder else {
             newerProjectBuilds = [:]
+            projectGitDates = [:]
+            server?.setProjectBuilds([:])
+            server?.setProjectGitDates([:])
             return
         }
         let latest = Dictionary(grouping: builds, by: { "\($0.platform.rawValue)/\($0.bundleIdentifier)" })
@@ -317,18 +446,45 @@ final class IPAStore {
         let result = await Task.detached {
             var projectBuilds: [URL: Int?] = [:]
             var newer: [String: Int] = [:]
+            var projects: [String: URL] = [:]
             for build in latest {
-                guard let released = Int(build.build),
-                      let project = try? IPARebuilder.findProject(bundleIdentifier: build.bundleIdentifier, appName: build.name,
+                guard let project = try? IPARebuilder.findProject(bundleIdentifier: build.bundleIdentifier, appName: build.name,
                                                                   devRoot: devRoot, ipaRoot: folderURL) else { continue }
+                projects[build.id] = project
+                guard let released = Int(build.build) else { continue }
                 let current = projectBuilds[project] ?? ProjectBuildNumber.read(project: project)
                 projectBuilds[project] = current
                 if let current, current > released { newer[build.id] = current }
             }
-            return newer
+            return (newer: newer, projects: projects)
         }.value
-        newerProjectBuilds = result
-        server?.setProjectBuilds(result)
+        newerProjectBuilds = result.newer
+        server?.setProjectBuilds(result.newer)
+        updateProjectGitDates(result.projects)
+    }
+
+    /// Les dates git demandent plusieurs commandes par projet : elles sont relevées à part, sans retarder les numéros
+    /// de build, au plus toutes les 30 secondes tant que les releases ne changent pas.
+    private func updateProjectGitDates(_ projects: [String: URL]) {
+        let releases = Set(projects.keys)
+        guard !isReadingGitDates,
+              releases != gitDatesReleases || Date().timeIntervalSince(lastGitRead) >= 30 else { return }
+        isReadingGitDates = true
+        Task {
+            let dates = await Task.detached {
+                var byProject: [URL: ProjectGitDates] = [:]
+                return projects.mapValues { project in
+                    let dates = byProject[project] ?? ProjectGitDates.read(project: project)
+                    byProject[project] = dates
+                    return dates
+                }
+            }.value
+            projectGitDates = dates
+            server?.setProjectGitDates(dates)
+            gitDatesReleases = releases
+            lastGitRead = Date()
+            isReadingGitDates = false
+        }
     }
 
     /// Nombre de builds qui ne sont pas le plus récent de leur app (par plateforme).
@@ -338,7 +494,10 @@ final class IPAStore {
 
     /// Supprime définitivement du disque toutes les anciennes versions, en ne gardant que le build le plus récent de chaque app.
     func cleanOldVersions() async {
-        guard let folderURL, !isScanning else { return }
+        // Attend la fin d'une éventuelle analyse (rafraîchissement auto toutes les 5 s) au lieu d'abandonner.
+        while isScanning { try? await Task.sleep(for: .milliseconds(100)) }
+        guard let folderURL else { return }
+        await refresh()
         let current = builds
         _ = await Task.detached {
             Self.pruneOldBuilds(current, keep: 1, rootURL: folderURL)
@@ -350,22 +509,38 @@ final class IPAStore {
     var outdatedBuilds: [IPABuild] { builds.filter { newerProjectBuilds[$0.id] != nil } }
 
     /// Recompile, l'un après l'autre, chaque app dont le projet est plus récent que sa release, puis
-    /// (si `clean`) supprime les anciennes versions.
-    func updateOutdatedBuilds(thenClean clean: Bool) async {
-        guard !isScanning, !isAddingProjects, rebuildingBundleID == nil else { return }
-        let targets = outdatedBuilds
+    /// (si `clean`) supprime les anciennes versions. Retourne les échecs.
+    @discardableResult
+    func updateOutdatedBuilds(thenClean clean: Bool) async -> [String] {
+        while isScanning { try? await Task.sleep(for: .milliseconds(100)) }
+        guard !isAddingProjects, rebuildingBundleID == nil else {
+            return [String(localized: "Une compilation est déjà en cours.")]
+        }
+        // Les projets sur lesquels un prompt tourne sont laissés pour plus tard.
+        let targets = outdatedBuilds.filter { !isCompilationBlocked($0) }
         var failures: [String] = []
+        let jobID = currentJob?.id
         for (index, build) in targets.enumerated() {
+            if let jobID, cancelledJobID == jobID { return failures }
             let position = "\(index + 1)/\(targets.count)"
             let error = await runRebuild(
                 label: build.bundleIdentifier, bundleIdentifier: build.bundleIdentifier, appName: build.name,
-                project: nil, platform: build.platform, reportsError: false,
-                onStep: { [weak self] step in self?.rebuildStatus = "\(position) · \(step)" }
+                project: nil, platform: build.platform, reportsError: false, managesJob: false,
+                onStep: { [weak self] step in
+                    let status = "\(position) · \(build.name) · \(step)"
+                    self?.rebuildStatus = status
+                    self?.updateJob(onlyIfRunning: true) { $0.step = status }
+                }
             )
+            if let jobID, cancelledJobID == jobID { return failures }
             if let error { failures.append("\(build.name) (\(build.platform.rawValue)) : \(error)") }
         }
-        if clean { await cleanOldVersions() }
+        if clean, jobID == nil || cancelledJobID != jobID {
+            updateJob(onlyIfRunning: true) { $0.step = String(localized: "Suppression des anciennes versions…") }
+            await cleanOldVersions()
+        }
         if !failures.isEmpty { rebuildError = failures.joined(separator: "\n\n") }
+        return failures
     }
 
     /// Recompile l'app de ce build depuis son projet Xcode (dossier parent du dossier des IPA)
@@ -397,72 +572,420 @@ final class IPAStore {
         await runRebuild(label: name, bundleIdentifier: nil, appName: name, project: url, platform: platform)
     }
 
-    /// Lance une recompilation demandée par un client distant ; retourne l'identifiant du job, ou nil si le Mac est occupé.
-    func startRemoteRebuild(_ build: IPABuild) -> String? {
-        guard folderURL != nil, rebuildingBundleID == nil else { return nil }
-        rebuildingBundleID = build.bundleIdentifier
-        let id = UUID().uuidString
-        Task {
-            await runRebuild(label: build.bundleIdentifier, bundleIdentifier: build.bundleIdentifier,
-                             appName: build.name, project: nil, platform: build.platform,
-                             jobID: id, alreadyClaimed: true)
+    /// Scan demandé par un client distant : retourne les projets en JSON. Pendant une compilation, le dernier
+    /// résultat est renvoyé sans nouveau scan.
+    func remoteProjectsJSON() async -> Data? {
+        // Un scan déjà en cours (fenêtre du Mac) est attendu plutôt que doublé.
+        if isScanningProjects {
+            while isScanningProjects { try? await Task.sleep(for: .milliseconds(100)) }
+        } else if !isBusy || scannedProjects.isEmpty {
+            await scanProjects()
         }
-        return id
+        let root = effectiveProjectsFolder
+        let projects: [[String: Any]] = scannedProjects.map { project in
+            var object: [String: Any] = [
+                "id": project.id,
+                "name": project.displayName,
+                "platforms": project.platforms.map { ["name": $0.rawValue, "served": isServed(project, platform: $0)] }
+            ]
+            object["scheme"] = project.scheme
+            object["bundleIdentifier"] = project.bundleIdentifier
+            object["problem"] = project.problem
+            object["folder"] = root.map { project.relativeFolder(to: $0) }
+            return object
+        }
+        var envelope: [String: Any] = ["apiVersion": 1, "projects": projects]
+        envelope["error"] = projectScanError
+        return try? JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys])
     }
 
-    private func updateJob(onlyIfRunning: Bool = false, _ change: (inout RebuildJob) -> Void) {
+    /// Met en file l'ajout d'un projet du dernier scan, demandé par un client distant.
+    func startRemoteAddProject(id: String, platform: String) -> ProjectAddResult {
+        guard let project = scannedProjects.first(where: { $0.id == id }), project.problem == nil,
+              let target = project.platforms.first(where: { $0.rawValue == platform }) else { return .notFound }
+        let name = project.displayName
+        let jobID = enqueue(app: name, platform: platform, kind: "rebuild", key: "add/\(platform)/\(id)") { [weak self] jobID in
+            await self?.runRebuild(label: name, bundleIdentifier: project.bundleIdentifier, appName: name,
+                                   project: project.url, scheme: project.scheme, platform: target, jobID: jobID)
+        }
+        return jobID.map { .started($0) } ?? .busy
+    }
+
+    /// Met en file une recompilation demandée par un client distant ; retourne l'identifiant du job.
+    func startRemoteRebuild(_ build: IPABuild) -> String? {
+        enqueue(app: build.name, platform: build.platform.rawValue, kind: "rebuild",
+                key: "rebuild/\(build.platform.rawValue)/\(build.bundleIdentifier)") { [weak self] jobID in
+            await self?.runRebuild(label: build.bundleIdentifier, bundleIdentifier: build.bundleIdentifier,
+                                   appName: build.name, project: nil, platform: build.platform, jobID: jobID)
+        }
+    }
+
+    /// Met en file la mise à jour de ServeIPA demandée par un client distant.
+    func startRemoteServerUpdate() -> String? {
+        enqueue(app: "ServeIPA", platform: IPABuild.Platform.macOS.rawValue, kind: "update", key: "update") { [weak self] jobID in
+            await self?.runRemoteServerUpdate(jobID: jobID)
+        }
+    }
+
+    func updateJob(onlyIfRunning: Bool = false, _ change: (inout RebuildJob) -> Void) {
         guard var job = currentJob, !onlyIfRunning || job.state == "running" else { return }
+        let wasRunning = job.state == "running"
         change(&job)
         currentJob = job
         server?.setRebuildJob(job)
+        if wasRunning, job.state != "running" { record(job) }
     }
 
     /// Retourne nil en cas de succès, sinon le message d'erreur (affiché dans une alerte si `reportsError`).
     @discardableResult
     private func runRebuild(label: String, bundleIdentifier: String?, appName: String,
                             project: URL?, scheme: String? = nil, platform: IPABuild.Platform,
-                            jobID: String = UUID().uuidString, alreadyClaimed: Bool = false,
-                            reportsError: Bool = true, onStep: (@MainActor (String) -> Void)? = nil) async -> String? {
-        guard let folderURL, alreadyClaimed || rebuildingBundleID == nil else {
-            if alreadyClaimed { rebuildingBundleID = nil }
+                            jobID: String = UUID().uuidString,
+                            reportsError: Bool = true, managesJob: Bool = true,
+                            onStep: (@MainActor (String) -> Void)? = nil) async -> String? {
+        guard let folderURL, rebuildingBundleID == nil else {
             return String(localized: "Une compilation est déjà en cours, ou le dossier des IPA n’est pas choisi.")
         }
         var failure: String?
         rebuildingBundleID = label
         rebuildStatus = nil
         rebuildError = nil
-        let initial = RebuildJob(id: jobID, app: appName, platform: platform.rawValue, state: "running",
-                                 step: String(localized: "Préparation…"), error: nil, startedAt: Date())
-        currentJob = initial
-        server?.setRebuildJob(initial)
+        if managesJob {
+            beginJob(RebuildJob(id: jobID, app: appName, platform: platform.rawValue, state: "running",
+                                step: String(localized: "Préparation…"), error: nil, startedAt: Date()))
+        }
+        // Une maintenance regroupe ses compilations dans le journal de son propre job.
+        let ownerID = managesJob ? jobID : currentJob?.id ?? jobID
+        let log = BuildLog.url(jobID: ownerID)
+        if let log { BuildLog.append("=== \(appName) (\(platform.rawValue)) — \(Date().formatted()) ===", to: log) }
         let root = folderURL
-        do {
-            _ = try await IPARebuilder.rebuild(
+        let devRoot = projectsFolderURL ?? root.deletingLastPathComponent()
+        let blocked = PromptActivity.blocksCompilation(
+            activePromptProjects,
+            names: [appName, scheme, project?.deletingPathExtension().lastPathComponent].compactMap { $0 },
+            bundleIdentifier: bundleIdentifier ?? "")
+        let task = Task {
+            if blocked { throw IPARebuilder.RebuildError.promptRunning(appName) }
+            return try await IPARebuilder.rebuild(
                 bundleIdentifier: bundleIdentifier,
                 appName: appName,
                 project: project,
                 scheme: scheme,
-                devRoot: projectsFolderURL ?? root.deletingLastPathComponent(),
+                devRoot: devRoot,
                 ipaRoot: root,
                 platform: platform,
-                progress: { message in
-                    Task { @MainActor in
+                log: log,
+                progress: { [weak self] message in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
                         self.rebuildStatus = message
-                        self.updateJob(onlyIfRunning: true) { $0.step = message }
+                        if managesJob { self.updateJob(onlyIfRunning: true) { $0.step = message } }
                         onStep?(message)
                     }
                 }
             )
-            updateJob { $0.state = "succeeded"; $0.step = String(localized: "Terminé") }
+        }
+        activeBuild = task
+        if cancelledJobID == ownerID { task.cancel() }
+        var export: URL?
+        do {
+            export = try await task.value
         } catch {
-            failure = error.localizedDescription
-            if reportsError { rebuildError = error.localizedDescription }
-            updateJob { $0.state = "failed"; $0.error = error.localizedDescription }
+            let cancelled = cancelledJobID == ownerID
+            let message = cancelled ? String(localized: "Compilation annulée.") : error.localizedDescription
+            failure = message
+            if let log { BuildLog.append(message, to: log) }
+            if reportsError, !cancelled { rebuildError = message }
+            if managesJob {
+                updateJob {
+                    $0.state = cancelled ? "cancelled" : "failed"
+                    $0.step = cancelled ? message : $0.step
+                    $0.error = cancelled ? nil : message
+                }
+            }
+        }
+        activeBuild = nil
+        if let export {
+            await removeBuilds(supersededBy: export, log: log)
+            // Annoncée une fois la liste à jour, pour que les clients la relisent sans les anciennes releases.
+            if managesJob { updateJob { $0.state = "succeeded"; $0.step = String(localized: "Terminé") } }
+        } else {
+            await refresh()
         }
         rebuildingBundleID = nil
         rebuildStatus = nil
-        await refresh()
         return failure
+    }
+
+    /// Après une compilation réussie : supprime définitivement les anciennes releases de la même app.
+    func removeBuilds(supersededBy export: URL, log: URL?) async {
+        await refresh()
+        guard let folderURL else { return }
+        let obsolete = ObsoleteBuilds.folders(in: builds, supersededBy: export, root: folderURL)
+        guard !obsolete.isEmpty else { return }
+        let failures = await Task.detached {
+            obsolete.compactMap { folder in
+                do {
+                    try FileManager.default.removeItem(at: folder)
+                    return nil
+                } catch {
+                    return "\(folder.lastPathComponent) : \(error.localizedDescription)"
+                }
+            }
+        }.value as [String]
+        if let log {
+            let names = obsolete.map(\.lastPathComponent).joined(separator: ", ")
+            BuildLog.append("Anciennes releases supprimées : \(names)", to: log)
+            for failure in failures { BuildLog.append("Suppression impossible : \(failure)", to: log) }
+        }
+        await refresh()
+    }
+
+    /// Copie une release macOS dans /Applications en remplaçant la version déjà installée.
+    /// Si c'est l'app en cours d'exécution (ServeIPA lui-même), l'installation passe par le script détaché
+    /// qui relance la nouvelle version.
+    func installInApplications(_ build: IPABuild) async {
+        guard build.platform == .macOS else { return }
+        if let error = await install(build) {
+            installMessage = String(localized: "Installation impossible : \(error)")
+        } else if postponedApps.contains(build.name) {
+            installMessage = String(localized: "« \(build.name) » est ouverte ou occupée : rien n’a été modifié. Quittez-la puis recommencez.")
+        } else if !isRunningApp(build) {
+            installMessage = String(localized: "« \(build.name) » \(build.version) (\(build.build)) est installée dans /Applications.")
+        }
+    }
+
+    private func applicationsDestination(for build: IPABuild) -> URL {
+        URL(fileURLWithPath: "/Applications", isDirectory: true)
+            .appending(path: build.fileURL.lastPathComponent, directoryHint: .isDirectory)
+    }
+
+    private func isRunningApp(_ build: IPABuild) -> Bool {
+        applicationsDestination(for: build).standardizedFileURL == SelfUpdater.runningApp
+    }
+
+    /// Retourne nil en cas de succès, sinon le message d'erreur.
+    private func install(_ build: IPABuild) async -> String? {
+        let destination = applicationsDestination(for: build)
+        if isRunningApp(build) {
+            do {
+                let jobID = currentJob.flatMap { $0.state == "running" ? $0.id : nil } ?? UUID().uuidString
+                try await relaunch(with: build.fileURL, to: destination, jobID: jobID)
+                return nil
+            } catch {
+                return error.localizedDescription
+            }
+        }
+        let source = build.fileURL
+        // Instances ouvertes depuis /Applications, relevées avant le remplacement.
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: build.bundleIdentifier).filter {
+            $0.bundleURL?.resolvingSymlinksInPath().standardizedFileURL.path
+                == destination.resolvingSymlinksInPath().standardizedFileURL.path
+        }
+        postponedApps.removeAll { $0 == build.name }
+        // L'app quitte avant d'être remplacée ; si elle reste ouverte ou travaille, rien n'est modifié.
+        if !running.isEmpty {
+            let pids = running.map(\.processIdentifier)
+            let identifier = build.bundleIdentifier
+            let busy = await Task.detached {
+                BusyApp.isBusy(bundleIdentifier: identifier, pids: pids, processList: BusyApp.processList())
+            }.value
+            if busy {
+                postponedApps.append(build.name)
+                return nil
+            }
+            if await !quit(running) {
+                postponedApps.append(build.name)
+                return nil
+            }
+        }
+        var failure: String?
+        do {
+            try await Task.detached { try Self.copyApp(source, to: destination) }.value
+            installRevision += 1
+        } catch {
+            failure = error.localizedDescription
+        }
+        // Rouvre la nouvelle version, ou l'ancienne restaurée après un échec.
+        if !running.isEmpty { await launch(destination) }
+        return failure
+    }
+
+    /// Demande aux instances de quitter, sans jamais les forcer. Faux si l'une d'elles reste ouverte.
+    private func quit(_ instances: [NSRunningApplication]) async -> Bool {
+        instances.forEach { _ = $0.terminate() }
+        let deadline = Date().addingTimeInterval(8)
+        while instances.contains(where: { !$0.isTerminated }) {
+            guard Date() < deadline else { return false }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        return true
+    }
+
+    private func launch(_ app: URL) async {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.createsNewApplicationInstance = true
+        _ = try? await NSWorkspace.shared.openApplication(at: app, configuration: configuration)
+    }
+
+    nonisolated static func executableDate(_ app: URL) -> Date? {
+        guard let info = NSDictionary(contentsOf: app.appending(path: "Contents/Info.plist")) as? [String: Any],
+              let name = info["CFBundleExecutable"] as? String else { return nil }
+        let path = app.appending(path: "Contents/MacOS/\(name)").path
+        return (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+    }
+
+    /// Vrai si l'app de /Applications a le même identifiant, la même version et le même build que cette release macOS,
+    /// et n'a pas été compilée avant elle.
+    nonisolated static func isInstalledInApplications(_ build: IPABuild) -> Bool {
+        guard build.platform == .macOS else { return false }
+        let app = URL(fileURLWithPath: "/Applications", isDirectory: true)
+            .appending(path: build.fileURL.lastPathComponent, directoryHint: .isDirectory)
+        let plist = app.appending(path: "Contents/Info.plist")
+        guard let info = NSDictionary(contentsOf: plist) as? [String: Any] else { return false }
+        return info["CFBundleIdentifier"] as? String == build.bundleIdentifier
+            && info["CFBundleShortVersionString"] as? String ?? "" == build.version
+            && info["CFBundleVersion"] as? String == build.build
+            && !isCompiled(app, before: build.builtAt)
+    }
+
+    nonisolated private static func isCompiled(_ app: URL, before release: Date?) -> Bool {
+        guard let release, let installed = executableDate(app) else { return false }
+        return release.timeIntervalSince(installed) > 5
+    }
+
+    /// Dernières releases macOS de chaque app qui ne sont pas (ou pas à jour) dans /Applications.
+    var missingInstallBuilds: [IPABuild] {
+        _ = installRevision // relit /Applications après chaque installation
+        return Dictionary(grouping: builds.filter { $0.platform == .macOS }, by: \.bundleIdentifier)
+            .values.compactMap { group in
+                group.max { ($0.folderDate ?? $0.folderName, Int($0.build) ?? -1) < ($1.folderDate ?? $1.folderName, Int($1.build) ?? -1) }
+            }
+            .filter { !Self.isInstalledInApplications($0) }
+            .sorted { $0.name < $1.name }
+    }
+
+    /// Copie dans /Applications les dernières releases macOS manquantes. ServeIPA lui-même passe en dernier,
+    /// car son installation relance l'app.
+    @discardableResult
+    func installMissingReleases() async -> (installed: Int, failures: [String]) {
+        let targets = missingInstallBuilds.sorted { !isRunningApp($0) && isRunningApp($1) }
+        var installed = 0
+        var failures: [String] = []
+        postponedApps = []
+        for build in targets {
+            // Relancer ServeIPA viderait la file : son installation attend qu'elle soit vide.
+            if isRunningApp(build), !pendingJobs.isEmpty { continue }
+            if let error = await install(build) {
+                failures.append("\(build.name) : \(error)")
+            } else if !postponedApps.contains(build.name) {
+                installed += 1
+            }
+        }
+        if !failures.isEmpty {
+            installMessage = String(localized: "Installation impossible :\n\(failures.joined(separator: "\n"))")
+        } else if installed > 0 {
+            installMessage = String(localized: "\(installed) app(s) installée(s) dans /Applications.")
+        }
+        if !postponedApps.isEmpty {
+            let names = postponedApps.formatted()
+            installMessage = [installMessage, String(localized: "Reportées (ouvertes ou occupées) : \(names).")]
+                .compactMap { $0 }.joined(separator: "\n")
+        }
+        return (installed, failures)
+    }
+
+    /// Recompile les apps dépassées (si `rebuild`), supprime les anciennes versions (si `clean`),
+    /// puis copie dans /Applications les releases manquantes.
+    /// Publie un job « maintenance » que les clients suivent via `GET /api/v1/builds`.
+    func runMaintenance(rebuild requested: Bool?, clean: Bool, jobID: String = UUID().uuidString) async {
+        guard !isRunningMaintenance else { return }
+        isRunningMaintenance = true
+        defer { isRunningMaintenance = false }
+        let job = RebuildJob(id: jobID, app: String(localized: "Baguette magique"), platform: "Mac", state: "running",
+                             step: String(localized: "Préparation…"), error: nil, startedAt: Date(), kind: "maintenance")
+        beginJob(job)
+
+        // Sans choix imposé, on recompile si un projet est plus récent que sa release.
+        if requested == nil { await updateNewerProjectBuilds() }
+        let rebuild = requested ?? !outdatedBuilds.isEmpty
+        let blockedNames = rebuild ? outdatedBuilds.filter { isCompilationBlocked($0) }.map(\.name) : []
+        let rebuilt = rebuild ? outdatedBuilds.count - blockedNames.count : 0
+        let oldBefore = oldBuildCount
+        var failures: [String] = []
+        var rebuildFailures = 0
+        if rebuild {
+            let rebuildErrors = await updateOutdatedBuilds(thenClean: clean)
+            rebuildFailures = rebuildErrors.count
+            failures += rebuildErrors
+        } else if clean, cancelledJobID != jobID {
+            updateJob { $0.step = String(localized: "Suppression des anciennes versions…") }
+            await cleanOldVersions()
+        }
+        if cancelledJobID == jobID {
+            updateJob { $0.state = "cancelled"; $0.step = String(localized: "Baguette magique annulée.") }
+            return
+        }
+        updateJob { $0.step = String(localized: "Copie dans /Applications…") }
+        let install = await installMissingReleases()
+        failures += install.failures
+
+        let removed = max(0, oldBefore + rebuilt - oldBuildCount)
+        var summary = String(localized: "\(max(0, rebuilt - rebuildFailures)) recompilée(s), \(removed) ancienne(s) version(s) supprimée(s), \(install.installed) copiée(s) dans /Applications.")
+        if !postponedApps.isEmpty {
+            let names = postponedApps.formatted()
+            summary += " " + String(localized: "Reportées (ouvertes ou occupées) : \(names).")
+        }
+        if !blockedNames.isEmpty {
+            summary += " " + String(localized: "Non recompilées (prompt rClaude en cours) : \(blockedNames.formatted()).")
+        }
+        updateJob {
+            $0.step = summary
+            if failures.isEmpty {
+                $0.state = "succeeded"
+            } else {
+                $0.state = "failed"
+                $0.error = failures.joined(separator: "\n")
+            }
+        }
+    }
+
+    /// Met en file la maintenance demandée par un client distant ; retourne l'identifiant du job.
+    func startRemoteMaintenance() -> String? {
+        enqueue(app: String(localized: "Baguette magique"), platform: "Mac", kind: "maintenance",
+                key: "maintenance") { [weak self] jobID in
+            await self?.runMaintenance(rebuild: nil, clean: true, jobID: jobID)
+        }
+    }
+
+    /// Remplace `destination` par une copie de `source` ; l'ancienne version est restaurée en cas d'échec.
+    nonisolated private static func copyApp(_ source: URL, to destination: URL) throws {
+        let fileManager = FileManager.default
+        let backup = destination.appendingPathExtension("ancienne")
+        try? fileManager.removeItem(at: backup)
+        let hadPrevious = fileManager.fileExists(atPath: destination.path)
+        if hadPrevious { try fileManager.moveItem(at: destination, to: backup) }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        process.arguments = [source.path, destination.path]
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
+        do {
+            try process.run()
+            let message = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError, userInfo: [
+                    NSLocalizedDescriptionKey: String(data: message, encoding: .utf8) ?? "ditto"
+                ])
+            }
+            try? fileManager.removeItem(at: backup)
+        } catch {
+            try? fileManager.removeItem(at: destination)
+            if hadPrevious { try? fileManager.moveItem(at: backup, to: destination) }
+            throw error
+        }
     }
 
     func delete(_ build: IPABuild) {
@@ -511,16 +1034,38 @@ final class IPAStore {
             let newServer = try OTAServer(port: port)
             newServer.update(builds: builds, rootURL: folderURL, publicURL: publicURL)
             newServer.deleteHandler = { [weak self] build in
-                try await MainActor.run {
+                try await MainActor.run { [weak self] in
                     guard let self else { throw DeleteError.unsafeDirectory }
                     try self.removeBuildDirectory(build)
                 }
             }
             newServer.rebuildHandler = { [weak self] build in
-                await MainActor.run { self?.startRemoteRebuild(build) }
+                await self?.startRemoteRebuild(build)
+            }
+            newServer.gitHandler = { [weak self] build, message, push in
+                await self?.runGitAction(build, message: message, push: push)
+                    ?? GitActionResult(succeeded: false, message: "ServeIPA n’est pas disponible.")
+            }
+            newServer.maintenanceHandler = { [weak self] in
+                await self?.startRemoteMaintenance()
+            }
+            newServer.projectsScanHandler = { [weak self] in
+                await self?.remoteProjectsJSON()
+            }
+            newServer.projectAddHandler = { [weak self] id, platform in
+                await self?.startRemoteAddProject(id: id, platform: platform) ?? .busy
+            }
+            newServer.serverUpdateHandler = { [weak self] in
+                await self?.startRemoteServerUpdate()
+            }
+            newServer.cancelHandler = { [weak self] id in
+                await self?.cancelJob(id) ?? false
             }
             newServer.setRebuildJob(currentJob)
+            newServer.setJobs(queue: pendingJobs.map(\.job), history: jobHistory)
+            newServer.setServerUpdate(serverUpdateDetail)
             newServer.setProjectBuilds(newerProjectBuilds)
+            newServer.setProjectGitDates(projectGitDates)
             server = newServer
             try newServer.start()
             try await Tailscale.serve(port: port)
@@ -566,12 +1111,31 @@ final class IPAStore {
         NSWorkspace.shared.open(serverURL)
     }
 
+    /// Appelé une fois au lancement de l'app, indépendamment de ses fenêtres.
     func startIfNeeded() async {
+        guard !hasStarted else { return }
+        hasStarted = true
         await refresh()
-        if startServerAutomatically {
+        // Vrai aussi quand le script d'installation le passe en argument de lancement.
+        let resumesAfterUpdate = UserDefaults.standard.bool(forKey: DefaultsKey.startServerAfterUpdate)
+        UserDefaults.standard.removeObject(forKey: DefaultsKey.startServerAfterUpdate)
+        resolvePendingUpdate()
+        // Boucle à part : une compilation longue ne doit pas figer l'indicateur.
+        Task { await watchPrompts() }
+        if startServerAutomatically || resumesAfterUpdate {
             await startServer()
         }
         await autoRefresh()
+    }
+
+    /// Relève toutes les 3 secondes les prompts rClaude en cours.
+    private func watchPrompts() async {
+        while !Task.isCancelled {
+            let projects = await Task.detached { PromptActivity.projects(in: PromptActivity.commands()) }.value
+            if projects != activePromptProjects { activePromptProjects = projects }
+            server?.setActivePrompts(projects)
+            try? await Task.sleep(for: .seconds(3))
+        }
     }
 
     /// Réanalyse le dossier toutes les 5 secondes jusqu'à l'annulation de la tâche.
@@ -582,7 +1146,27 @@ final class IPAStore {
             if !isScanning {
                 await refresh()
             }
+            // La recherche d'une mise à jour lit toutes les sources : pas à chaque tour.
+            if Date().timeIntervalSince(lastUpdateCheck) >= 10 {
+                lastUpdateCheck = Date()
+                await checkForServerUpdate()
+            }
+            await runNightlyBuildIfDue()
         }
+    }
+
+    /// Lance la maintenance complète (baguette magique) une fois par nuit, pendant l'heure de 1 h,
+    /// si l'option est activée et que le serveur tourne.
+    private func runNightlyBuildIfDue(now: Date = Date()) async {
+        guard nightlyBuild, serverState == .running,
+              Calendar.current.component(.hour, from: now) == 1,
+              !isScanning, !isBusy, pendingJobs.isEmpty else { return }
+        let today = Calendar.current.startOfDay(for: now)
+        if let last = UserDefaults.standard.object(forKey: DefaultsKey.lastNightlyRun) as? Date,
+           Calendar.current.isDate(last, inSameDayAs: today) { return }
+        // Noté avant de commencer : une recompilation de ServeIPA lui-même relance l'app.
+        UserDefaults.standard.set(now, forKey: DefaultsKey.lastNightlyRun)
+        await runMaintenance(rebuild: nil, clean: true)
     }
 
     private func restoreFolder() {
@@ -676,7 +1260,8 @@ final class IPAStore {
                         urlSchemes: [],
                         minimumOSVersion: metadata.minimumOSVersion,
                         iconEntry: metadata.iconEntry,
-                        platform: .macOS
+                        platform: .macOS,
+                        builtAt: Self.executableDate(url)
                     ))
                 } catch {
                     issues.append(ScanIssue(path: url.lastPathComponent, message: error.localizedDescription))
@@ -789,6 +1374,8 @@ enum IPAMetadataReader {
             ?? files.first(where: { $0.hasSuffix(".png") && $0.localizedCaseInsensitiveContains("icon") }) {
             icon = "Contents/Resources/" + found
         }
+        // Icône Icon Composer / Assets.car seule : on demandera son rendu au système.
+        if icon == nil { icon = workspaceIconEntry }
         return Metadata(
             name: info["CFBundleDisplayName"] as? String
                 ?? info["CFBundleName"] as? String
@@ -848,8 +1435,16 @@ enum IPAMetadataReader {
         return pngThumbnail(raw, maxPixels: maxPixels)
     }
 
-    /// Icône d'une app macOS (.icns ou PNG dans le bundle), convertie en PNG.
+    /// Valeur d'`iconEntry` signifiant « pas de fichier d'icône : utiliser celle que macOS affiche pour l'app ».
+    nonisolated static let workspaceIconEntry = "workspace-icon"
+
+    /// Icône d'une app macOS (.icns ou PNG dans le bundle, sinon rendu du système), convertie en PNG.
     nonisolated static func iconPNG(appURL: URL, entry: String, maxPixels: Int = 180) -> Data? {
+        if entry == workspaceIconEntry {
+            let icon = NSWorkspace.shared.icon(forFile: appURL.path)
+            guard let tiff = icon.tiffRepresentation else { return nil }
+            return pngThumbnail(tiff, maxPixels: maxPixels)
+        }
         guard let raw = try? Data(contentsOf: appURL.appending(path: entry)) else { return nil }
         return pngThumbnail(raw, maxPixels: maxPixels)
     }

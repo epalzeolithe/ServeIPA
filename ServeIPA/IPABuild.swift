@@ -23,13 +23,15 @@ struct IPABuild: Identifiable, Equatable, Sendable {
     var iconEntry: String? = nil
     /// iOS : fichier .ipa ; macOS : bundle .app (`fileURL`).
     var platform: Platform = .iOS
+    /// macOS : date de l'exécutable, qui distingue deux compilations de même numéro.
+    var builtAt: Date? = nil
 
     var displayName: String {
         let name = Self.folderDetails(folderName).name
         return platform == .macOS && name.hasSuffix("-macos") ? String(name.dropLast("-macos".count)) : name
     }
 
-    static func folderDetails(_ folder: String) -> (name: String, date: String?) {
+    nonisolated static func folderDetails(_ folder: String) -> (name: String, date: String?) {
         let pattern = #"^(.*?)[ _-]+(\d{4}-\d{2}-\d{2})[ _T]+(\d{2})[-:](\d{2})(?:[-:](\d{2}))?$"#
         guard let expression = try? NSRegularExpression(pattern: pattern),
               let match = expression.firstMatch(

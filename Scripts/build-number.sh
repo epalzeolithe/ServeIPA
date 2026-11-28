@@ -9,9 +9,7 @@ set -e
 state="${PROJECT_DIR}/.build-number"
 plist="${TARGET_BUILD_DIR}/${INFOPLIST_PATH}"
 
-hash=$(cd "$PROJECT_DIR" && find ServeIPA ServeIPAClient Configuration -type f \
-    \( -name '*.swift' -o -name '*.plist' -o -name '*.xcstrings' -o -name '*.entitlements' \) -print0 \
-    | sort -z | xargs -0 shasum | shasum | cut -d' ' -f1)
+hash=$(/bin/sh "${PROJECT_DIR}/Scripts/source-fingerprint.sh" "$PROJECT_DIR")
 
 last_hash=""
 number=0

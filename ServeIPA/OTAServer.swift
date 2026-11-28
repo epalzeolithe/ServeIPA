@@ -2,24 +2,34 @@ import Foundation
 import Network
 
 /// État de la dernière recompilation lancée sur le Mac, exposé par `GET /api/v1/builds`.
-nonisolated struct RebuildJob: Sendable {
+nonisolated struct RebuildJob: Codable, Sendable {
     var id: String
     var app: String
     var platform: String
-    /// running, succeeded ou failed.
+    /// queued, running, succeeded, failed ou cancelled.
     var state: String
     var step: String
     var error: String?
     var startedAt: Date
+    /// « rebuild » (une app), « maintenance » (baguette magique : recompilation, nettoyage, copie)
+    /// ou « update » (mise à jour de ServeIPA).
+    var kind: String = "rebuild"
 
     var json: [String: Any] {
         var object: [String: Any] = [
             "id": id, "app": app, "platform": platform, "state": state,
-            "step": step, "startedAt": startedAt.timeIntervalSince1970
+            "step": step, "startedAt": startedAt.timeIntervalSince1970, "kind": kind
         ]
         object["error"] = error
         return object
     }
+}
+
+/// Résultat d'une demande d'ajout de projet (`POST /api/v1/projects`).
+enum ProjectAddResult: Sendable {
+    case started(String)
+    case busy
+    case notFound
 }
 
 final class OTAServer: @unchecked Sendable {
@@ -56,9 +66,29 @@ final class OTAServer: @unchecked Sendable {
     var deleteHandler: (@Sendable (IPABuild) async throws -> Void)?
     /// Lance la recompilation d'une app ; retourne l'identifiant du job, ou nil si une compilation est déjà en cours.
     var rebuildHandler: (@Sendable (IPABuild) async -> String?)?
+    /// Indexe et valide le projet d'une app, puis pousse au besoin (`POST /api/v1/git?app=…&message=…&push=1`).
+    var gitHandler: (@Sendable (IPABuild, String, Bool) async -> GitActionResult)?
+    /// Lance la baguette magique (`POST /api/v1/maintenance`) ; retourne l'identifiant du job, ou nil si le Mac est occupé.
+    var maintenanceHandler: (@Sendable () async -> String?)?
+    /// Scanne le dossier des projets Xcode ; retourne le JSON `{"projects": […]}` (nil si le Mac est occupé).
+    var projectsScanHandler: (@Sendable () async -> Data?)?
+    /// Compile et ajoute un projet trouvé par le scan (identifiant du projet, plateforme).
+    var projectAddHandler: (@Sendable (String, String) async -> ProjectAddResult)?
+    /// Met à jour ServeIPA (`POST /api/v1/server/update`) ; retourne l'identifiant du job, ou nil si le Mac est occupé.
+    var serverUpdateHandler: (@Sendable () async -> String?)?
+    /// Annule un job en attente ou en cours (`DELETE /api/v1/builds?job=…`).
+    var cancelHandler: (@Sendable (String) async -> Bool)?
     private var rebuildJob: RebuildJob?
+    private var queuedJobs: [RebuildJob] = []
+    private var finishedJobs: [RebuildJob] = []
+    private var serverUpdateDetail: String?
+    private var activePrompts: [String] = []
     /// Numéro de build du projet Xcode, par identifiant de build, quand il dépasse celui de la release.
     private var projectBuilds: [String: Int] = [:]
+    /// Change dès que la liste des apps publiée change : les clients la relisent alors sans attendre.
+    private var catalogRevision = UUID().uuidString
+    private var releaseIDs: Set<String> = []
+    private var projectGitDates: [String: ProjectGitDates] = [:]
 
     private let listener: NWListener
     private let queue = DispatchQueue(label: "ServeIPA.HTTPServer", qos: .userInitiated)
@@ -79,6 +109,9 @@ final class OTAServer: @unchecked Sendable {
 
     func update(builds: [IPABuild], rootURL: URL, publicURL: URL?) {
         lock.withLock {
+            let ids = Set(builds.map(\.id))
+            if ids != releaseIDs { catalogRevision = UUID().uuidString }
+            releaseIDs = ids
             snapshot = Snapshot(
                 buildsByPath: Dictionary(uniqueKeysWithValues: builds.filter { $0.platform == .iOS }.map { ($0.relativePath, $0) }),
                 macBuildsByPath: Dictionary(uniqueKeysWithValues: builds.filter { $0.platform == .macOS }.map { ($0.relativePath, $0) }),
@@ -89,11 +122,36 @@ final class OTAServer: @unchecked Sendable {
     }
 
     func setProjectBuilds(_ builds: [String: Int]) {
-        lock.withLock { projectBuilds = builds }
+        lock.withLock {
+            if projectBuilds != builds { catalogRevision = UUID().uuidString }
+            projectBuilds = builds
+        }
+    }
+
+    func setProjectGitDates(_ dates: [String: ProjectGitDates]) {
+        lock.withLock {
+            if projectGitDates != dates { catalogRevision = UUID().uuidString }
+            projectGitDates = dates
+        }
     }
 
     func setRebuildJob(_ job: RebuildJob?) {
         lock.withLock { rebuildJob = job }
+    }
+
+    func setJobs(queue: [RebuildJob], history: [RebuildJob]) {
+        lock.withLock {
+            queuedJobs = queue
+            finishedJobs = history
+        }
+    }
+
+    func setActivePrompts(_ projects: [String]) {
+        lock.withLock { activePrompts = projects }
+    }
+
+    func setServerUpdate(_ detail: String?) {
+        lock.withLock { serverUpdateDetail = detail }
     }
 
     func start() throws {
@@ -241,11 +299,12 @@ final class OTAServer: @unchecked Sendable {
                 "serverVersion": info.version, "serverBuild": info.build
             ]
             health["serverBuildDate"] = AppBuildInfo.rawDate
+            health["hostName"] = ProcessInfo.processInfo.hostName
             sendJSON(health, on: connection)
             return
         }
         if path == "/api/v1/apps", method == "GET" {
-            let projectBuilds = lock.withLock { self.projectBuilds }
+            let (projectBuilds, gitDates) = lock.withLock { (self.projectBuilds, self.projectGitDates) }
             let wantsMac = Self.queryValue("platform", in: query) == "macOS"
             let apps: [[String: Any]] = (wantsMac ? current.macBuildsByPath : current.buildsByPath).values.sorted {
                 ($0.folderDate ?? $0.folderName, $0.name) > ($1.folderDate ?? $1.folderName, $1.name)
@@ -261,6 +320,12 @@ final class OTAServer: @unchecked Sendable {
                 object["date"] = build.folderDate
                 object["minimumOSVersion"] = build.minimumOSVersion
                 object["projectBuild"] = projectBuilds[build.id]
+                object["builtAt"] = build.builtAt?.timeIntervalSince1970
+                object["lastCommit"] = gitDates[build.id]?.lastCommit?.timeIntervalSince1970
+                object["lastPush"] = gitDates[build.id]?.lastPush?.timeIntervalSince1970
+                object["lastCommitBuild"] = gitDates[build.id]?.commitBuild
+                object["lastPushBuild"] = gitDates[build.id]?.pushBuild
+                object["isServer"] = build.platform == .macOS && build.bundleIdentifier == Bundle.main.bundleIdentifier
                 return object
             }
             sendJSON(["apiVersion": 1, "apps": apps], on: connection)
@@ -334,8 +399,39 @@ final class OTAServer: @unchecked Sendable {
             return
         }
         if path == "/api/v1/builds", method == "GET" {
-            let job = lock.withLock { rebuildJob }
-            sendJSON(["apiVersion": 1, "job": job?.json ?? NSNull()], on: connection)
+            let (job, queued, finished, update) = lock.withLock {
+                (rebuildJob, queuedJobs, finishedJobs, serverUpdateDetail)
+            }
+            var status: [String: Any] = [
+                "apiVersion": 1, "job": job?.json ?? NSNull(),
+                "queue": queued.map(\.json), "history": finished.map(\.json)
+            ]
+            status["serverUpdate"] = update
+            status["activePrompts"] = lock.withLock { activePrompts }
+            status["catalogRevision"] = lock.withLock { catalogRevision }
+            sendJSON(status, on: connection)
+            return
+        }
+        if path == "/api/v1/builds/log", method == "GET" {
+            guard let jobID = Self.queryValue("job", in: query), let log = BuildLog.tail(jobID: jobID) else {
+                sendJSON(["error": "Log unavailable"], status: "404 Not Found", on: connection)
+                return
+            }
+            send(status: "200 OK", body: log, contentType: "text/plain; charset=utf-8", on: connection)
+            return
+        }
+        if path == "/api/v1/builds", method == "DELETE" {
+            guard let jobID = Self.queryValue("job", in: query), let cancelHandler else {
+                sendJSON(["error": "Missing job"], status: "400 Bad Request", on: connection)
+                return
+            }
+            Task {
+                if await cancelHandler(jobID) {
+                    self.sendJSON(["id": jobID], on: connection)
+                } else {
+                    self.sendJSON(["error": "Job cannot be cancelled"], status: "404 Not Found", on: connection)
+                }
+            }
             return
         }
         if path == "/api/v1/builds", method == "POST" {
@@ -350,6 +446,90 @@ final class OTAServer: @unchecked Sendable {
             }
             Task {
                 if let jobID = await rebuildHandler(build) {
+                    self.sendJSON(["id": jobID], status: "202 Accepted", on: connection)
+                } else {
+                    self.sendJSON(["error": "A build is already running"], status: "409 Conflict", on: connection)
+                }
+            }
+            return
+        }
+        if path == "/api/v1/git", method == "POST" {
+            guard let buildID = Self.queryValue("app", in: query),
+                  let build = current.buildsByPath[buildID] ?? current.macBuildsByPath[buildID] else {
+                sendJSON(["error": "App unavailable"], status: "404 Not Found", on: connection)
+                return
+            }
+            let message = (Self.queryValue("message", in: query) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !message.isEmpty, message.count <= 1000 else {
+                sendJSON(["error": "Missing or oversized message"], status: "400 Bad Request", on: connection)
+                return
+            }
+            guard let gitHandler else {
+                sendJSON(["error": "Git unavailable"], status: "503 Service Unavailable", on: connection)
+                return
+            }
+            let push = Self.queryValue("push", in: query) == "1"
+            Task {
+                let result = await gitHandler(build, message, push)
+                self.sendJSON([result.succeeded ? "message" : "error": result.message],
+                              status: result.succeeded ? "200 OK" : "409 Conflict", on: connection)
+            }
+            return
+        }
+        if path == "/api/v1/projects", method == "GET" {
+            guard let projectsScanHandler else {
+                sendJSON(["error": "Scan unavailable"], status: "503 Service Unavailable", on: connection)
+                return
+            }
+            Task {
+                if let data = await projectsScanHandler() {
+                    self.send(status: "200 OK", body: data, contentType: "application/json; charset=utf-8", on: connection)
+                } else {
+                    self.sendJSON(["error": "A build is already running"], status: "409 Conflict", on: connection)
+                }
+            }
+            return
+        }
+        if path == "/api/v1/projects", method == "POST" {
+            guard let projectID = Self.queryValue("project", in: query),
+                  let platform = Self.queryValue("platform", in: query) else {
+                sendJSON(["error": "Missing project or platform"], status: "400 Bad Request", on: connection)
+                return
+            }
+            guard let projectAddHandler else {
+                sendJSON(["error": "Project add unavailable"], status: "503 Service Unavailable", on: connection)
+                return
+            }
+            Task {
+                switch await projectAddHandler(projectID, platform) {
+                case .started(let jobID): self.sendJSON(["id": jobID], status: "202 Accepted", on: connection)
+                case .busy: self.sendJSON(["error": "A build is already running"], status: "409 Conflict", on: connection)
+                case .notFound: self.sendJSON(["error": "Project unavailable"], status: "404 Not Found", on: connection)
+                }
+            }
+            return
+        }
+        if path == "/api/v1/server/update", method == "POST" {
+            guard let serverUpdateHandler else {
+                sendJSON(["error": "Update unavailable"], status: "503 Service Unavailable", on: connection)
+                return
+            }
+            Task {
+                if let jobID = await serverUpdateHandler() {
+                    self.sendJSON(["id": jobID], status: "202 Accepted", on: connection)
+                } else {
+                    self.sendJSON(["error": "A build is already running"], status: "409 Conflict", on: connection)
+                }
+            }
+            return
+        }
+        if path == "/api/v1/maintenance", method == "POST" {
+            guard let maintenanceHandler else {
+                sendJSON(["error": "Maintenance unavailable"], status: "503 Service Unavailable", on: connection)
+                return
+            }
+            Task {
+                if let jobID = await maintenanceHandler() {
                     self.sendJSON(["id": jobID], status: "202 Accepted", on: connection)
                 } else {
                     self.sendJSON(["error": "A build is already running"], status: "409 Conflict", on: connection)
