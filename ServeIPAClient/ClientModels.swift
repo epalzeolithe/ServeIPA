@@ -124,8 +124,8 @@ struct RebuildJob: Decodable, Equatable, Identifiable {
     }
 
     /// Titre affiché avant, pendant et après le job.
-    var title: String {
-        if isMaintenance { return state == "running" ? "Baguette magique sur le Mac" : "Baguette magique" }
+    func title(on mac: String) -> String {
+        if isMaintenance { return state == "running" ? "Baguette magique sur \(mac)" : "Baguette magique" }
         if isServerUpdate { return "Mise à jour du serveur" }
         return state == "running" ? "Recompilation de \(app)" : "\(app) · \(platform)"
     }

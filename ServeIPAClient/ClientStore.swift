@@ -46,6 +46,20 @@ final class ClientStore {
     var isConnected = false
     /// Nom d'hôte du Mac serveur (absent sur les anciens serveurs).
     var serverHostName: String?
+    /// Nom donné au Mac serveur ; absent sur les anciens serveurs.
+    var serverComputerName: String?
+    /// Nom à afficher pour le Mac serveur, ou « le Mac » s'il n'est pas connu.
+    var serverMacName: String { Self.macName(computerName: serverComputerName, hostName: serverHostName) }
+
+    nonisolated static func macName(computerName: String?, hostName: String?) -> String {
+        if let computerName, !computerName.isEmpty { return computerName }
+        // Un nom d'hôte venu du fournisseur d'accès (adresse en clair) n'est pas un nom de Mac.
+        if let hostName, !hostName.isEmpty {
+            let parts = hostName.split(separator: ".")
+            if parts.count == 1 || parts.last == "local" { return String(parts[0]) }
+        }
+        return "le Mac"
+    }
     /// Dernière actualisation réussie.
     var lastContact: Date?
     var isLoading = false
@@ -160,6 +174,7 @@ final class ClientStore {
                 let serverBuild: String?
                 let serverBuildDate: String?
                 let hostName: String?
+                let computerName: String?
             }
             guard let health = try? JSONDecoder().decode(Health.self, from: data),
                   health.service == "ServeIPA", health.apiVersion == 1 else {
@@ -179,6 +194,7 @@ final class ClientStore {
             apps = catalog.apps.filter { ($0.isMac) == Platform.isMac }
             serverInfo = info
             serverHostName = health.hostName
+            serverComputerName = health.computerName
             lastContact = Date()
             isConnected = true
             connectionMessage = base.host?.hasSuffix(".ts.net") == true

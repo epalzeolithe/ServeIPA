@@ -143,7 +143,7 @@ struct ContentView: View {
     }
 
     private func jobRow(_ job: RebuildJob) -> some View {
-        RebuildStatusRow(job: job,
+        RebuildStatusRow(job: job, macName: store.serverMacName,
                          cancel: { Task { await store.cancel(job) } },
                          showLog: { logJob = job },
                          dismiss: { store.dismiss(job) })
@@ -337,7 +337,7 @@ struct ContentView: View {
                 }
                 #if !os(macOS)
                 if !store.visibleJobs.isEmpty {
-                    Section("Compilations sur le Mac") {
+                    Section("Compilations sur \(store.serverMacName)") {
                         ForEach(store.visibleJobs) { jobRow($0) }
                     }
                 }
@@ -771,7 +771,7 @@ private struct AppRow: View {
         )
     }
 
-    private var hasBadges: Bool { showsNewBadge || isWorking || isRunningPrompt }
+    private var hasBadges: Bool { showsNewBadge }
 
     /// Version installée, connue pour la ligne principale seulement (sur iOS, d'après les installations faites d'ici).
     private var installed: InstallRecord? { isLatest ? lastInstall : nil }
@@ -797,10 +797,19 @@ private struct AppRow: View {
 
     /// Les numéros côte à côte, dans l'ordre : installé, disponible sur le serveur, projet à compiler.
     /// Ils s'empilent quand la largeur manque.
+    /// La roue d'activité puis l'indicateur de prompt les suivent sur la même ligne, quelle que soit la largeur.
     private var versionItems: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .firstTextBaseline, spacing: 10) { versionNumbers }
-            VStack(alignment: .leading, spacing: 2) { versionNumbers }
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .firstTextBaseline, spacing: 10) { versionNumbers }
+                VStack(alignment: .leading, spacing: 2) { versionNumbers }
+            }
+            if isWorking {
+                ActivityBadge()
+                    .help("Compilation ou téléchargement en cours")
+                    .accessibilityLabel("Compilation ou téléchargement en cours")
+            }
+            promptIndicator
         }
         .layoutPriority(1)
     }
@@ -851,7 +860,6 @@ private struct AppRow: View {
         .accessibilityLabel("\(label) : \(text)")
     }
 
-    /// Badge « nouveau », roue d'activité, puis l'indicateur de prompt en cours, toujours en dernier.
     @ViewBuilder
     private var badgeItems: some View {
         if showsNewBadge {
@@ -863,33 +871,44 @@ private struct AppRow: View {
                 .fixedSize()
                 .accessibilityLabel("Version plus récente disponible")
         }
-        if isWorking {
-            ProgressView()
-                .controlSize(.mini)
-                .help("Compilation ou téléchargement en cours")
-                .accessibilityLabel("Compilation ou téléchargement en cours")
-        }
-        promptIndicator
     }
 
-    /// En tête de ligne : l'icône du serveur et le numéro de build qui y est disponible, avant sa date.
+    /// En tête de ligne : l'icône du serveur et le numéro de build qui y est disponible, avant sa date. Puis la taille,
+    /// le dernier commit et le dernier push du projet, et le nom du dossier s’il diffère du nom de l’app.
     private var detailsText: Text {
-        Text("\(Image(systemName: "server.rack")) (\(app.build)) \(details)")
+        var head: [String] = []
+        if let date = app.date { head.append(Self.shortDate(date)) }
+        head.append(ByteCountFormatter.string(fromByteCount: app.size, countStyle: .file))
+        var text = Text("\(Image(systemName: "server.rack")) (\(app.build)) \(head.joined(separator: " · "))")
+        if isLatest {
+            if let commit = app.lastCommit {
+                text = Text("\(text) · \(gitEvent("commit", app.lastCommitBuild, commit))")
+            }
+            if let push = app.lastPush {
+                text = Text("\(text) · \(gitEvent("push", app.lastPushBuild, push))")
+            }
+        }
+        var tail: [String] = []
+        if olderCount > 0 { tail.append(olderCount == 1 ? "1 ancien" : "\(olderCount) anciens") }
+        // Nom du dossier d'export (souvent le scheme Xcode) : utile sur Mac seulement.
+        if app.isMac, app.displayName != app.name { tail.append(app.displayName) }
+        return tail.isEmpty ? text : Text("\(text) · \(tail.joined(separator: " · "))")
     }
 
-    /// Date · taille · dernier commit et push du projet · nom du dossier s’il diffère du nom de l’app.
-    private var details: String {
-        var parts: [String] = []
-        if let date = app.date { parts.append(Self.shortDate(date)) }
-        parts.append(ByteCountFormatter.string(fromByteCount: app.size, countStyle: .file))
-        if isLatest {
-            if let commit = app.lastCommit { parts.append(Self.gitEvent("commit", app.lastCommitBuild, commit)) }
-            if let push = app.lastPush { parts.append(Self.gitEvent("push", app.lastPushBuild, push)) }
-        }
-        if olderCount > 0 { parts.append(olderCount == 1 ? "1 ancien" : "\(olderCount) anciens") }
-        // Nom du dossier d'export (souvent le scheme Xcode) : utile sur Mac seulement.
-        if app.isMac, app.displayName != app.name { parts.append(app.displayName) }
-        return parts.joined(separator: " · ")
+    /// Numéro le plus avancé connu pour cette app : release, projet, commit ou push.
+    private var mostRecentBuild: Int {
+        [Int(app.build), app.projectBuild, app.lastCommitBuild, app.lastPushBuild].compactMap { $0 }.max() ?? 0
+    }
+
+    /// « commit (53) 22 nov 14:48 » : le numéro de build précède la date, quand il est connu. Une petite horloge
+    /// orange le suit s'il est en retard sur le plus récent.
+    private func gitEvent(_ name: String, _ build: Int?, _ seconds: Double) -> Text {
+        let date = Self.shortDate(Date(timeIntervalSince1970: seconds))
+        guard let build else { return Text("\(name) \(date)") }
+        guard build < mostRecentBuild else { return Text("\(name) (\(String(build))) \(date)") }
+        let mark = Text(Image(systemName: "clock.badge.exclamationmark")).foregroundStyle(.orange)
+            .accessibilityLabel("En retard sur le build \(mostRecentBuild)")
+        return Text("\(name) (\(String(build))) \(mark) \(date)")
     }
 
     private static let inputFormat: DateFormatter = {
@@ -902,12 +921,6 @@ private struct AppRow: View {
     private static func shortDate(_ text: String) -> String {
         guard let date = inputFormat.date(from: text) else { return text }
         return shortDate(date)
-    }
-
-    /// « commit (53) 22 nov 14:48 » : le numéro de build précède la date, quand il est connu.
-    private static func gitEvent(_ name: String, _ build: Int?, _ seconds: Double) -> String {
-        [name, build.map { "(\($0))" }, shortDate(Date(timeIntervalSince1970: seconds))]
-            .compactMap { $0 }.joined(separator: " ")
     }
 
     private static func shortDate(_ date: Date) -> String {
@@ -960,6 +973,18 @@ private struct GlassCapsule: ViewModifier {
                 Capsule().strokeBorder(.white.opacity(0.35), lineWidth: 1)
             }
         }
+    }
+}
+
+/// Petite roue d'activité alignée sur une ligne de texte. Seule, elle n'a pas de ligne de base : dans une rangée
+/// alignée sur le texte, elle se pose dessus et paraît trop haute. Elle est donc centrée sur un texte invisible.
+private struct ActivityBadge: View {
+    var body: some View {
+        Text(verbatim: "0")
+            .font(.subheadline)
+            .hidden()
+            .frame(width: 16)
+            .overlay { ProgressView().controlSize(.mini) }
     }
 }
 
@@ -1028,6 +1053,7 @@ private struct ConnectionShield: View {
 /// Compilation sur le Mac : en file, en cours (annulable), réussie, annulée ou en échec.
 private struct RebuildStatusRow: View {
     let job: RebuildJob
+    let macName: String
     let cancel: () -> Void
     let showLog: () -> Void
     let dismiss: () -> Void
@@ -1047,7 +1073,7 @@ private struct RebuildStatusRow: View {
                 ProgressView()
             }
             VStack(alignment: .leading, spacing: 2) {
-                Text(job.title)
+                Text(job.title(on: macName))
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
                 Text(job.detail)

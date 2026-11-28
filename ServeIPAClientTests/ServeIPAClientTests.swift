@@ -75,6 +75,13 @@ struct ServeIPAClientTests {
         #expect(!ClientStore.isNewer(146, than: "—"))
     }
 
+    @Test func namesTheServerMac() {
+        #expect(ClientStore.macName(computerName: "Lucifer", hostName: "autre.local") == "Lucifer")
+        #expect(ClientStore.macName(computerName: nil, hostName: "lucifer.local") == "lucifer")
+        #expect(ClientStore.macName(computerName: nil, hostName: "2a01.ipv6.example.net") == "le Mac")
+        #expect(ClientStore.macName(computerName: nil, hostName: nil) == "le Mac")
+    }
+
     @Test func formatsAppDates() throws {
         let day = { (year: Int, month: Int, day: Int) in
             try #require(Calendar.current.date(from: DateComponents(year: year, month: month, day: day, hour: 12)))

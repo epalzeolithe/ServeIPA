@@ -300,6 +300,7 @@ final class OTAServer: @unchecked Sendable {
             ]
             health["serverBuildDate"] = AppBuildInfo.rawDate
             health["hostName"] = ProcessInfo.processInfo.hostName
+            health["computerName"] = Self.computerName
             sendJSON(health, on: connection)
             return
         }
@@ -625,6 +626,9 @@ final class OTAServer: @unchecked Sendable {
         }
         return archive
     }
+
+    /// Nom du Mac tel qu'il est réglé dans Réglages Système ; le nom d'hôte, lui, dépend du réseau.
+    private static let computerName = Host.current().localizedName
 
     private static func queryValue(_ name: String, in query: String) -> String? {
         for pair in query.split(separator: "&") {
