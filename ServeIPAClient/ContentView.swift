@@ -248,6 +248,7 @@ struct ContentView: View {
                       downloadDisabled: Platform.isMac ? isInstallingOnMac : store.downloadingAppID != nil,
                       isFlashing: flashingAppID == app.id && flashOn,
                       isUpdateBlocked: store.isUpdateBlocked(app),
+                      isWaitingForServer: store.isWaitingForServerUpdate(app),
                       install: { requestInstall(app) },
                       download: { store.download(app) },
                       open: { openWithFeedback(app) },
@@ -308,12 +309,17 @@ struct ContentView: View {
                                 Text("Build \(max(Int(update.build) ?? 0, update.projectBuild ?? 0)) disponible, build \(AppBuildInfo.current.build) en cours.")
                                     .font(.caption).foregroundStyle(.secondary)
                                 if store.isSelfUpdateBlocked { promptNotice }
+                                if store.isWaitingForServerUpdate(update) {
+                                    Label("Mise à jour du serveur en cours", systemImage: "clock")
+                                        .font(.caption)
+                                        .foregroundStyle(.orange)
+                                }
                             }
                             Spacer(minLength: 4)
                             // Sans autre confirmation : iOS demande la sienne, le Mac relance le client.
                             Button("Mettre à jour") { Task { await store.installCompilingIfNeeded(update) } }
                                 .buttonStyle(.bordered)
-                                .disabled(store.isSelfUpdateBlocked)
+                                .disabled(store.installBlockedMessage(update) != nil)
                         }
                     }
                 }
@@ -483,7 +489,7 @@ struct ContentView: View {
                     Button("Baguette magique sur le Mac", systemImage: "wand.and.stars") {
                         showsServerMaintenance = true
                     }
-                    .help("Recompiler sur le Mac les apps dont le projet est plus récent, nettoyer les anciennes versions et copier les releases dans /Applications")
+                    .help("Recompiler sur le Mac les apps dont le projet est plus récent, nettoyer les anciennes versions, copier les releases dans /Applications, puis commiter et pousser les projets")
                     .disabled(!store.isConnected)
                 }
                 ToolbarItem(placement: .primaryAction) {
@@ -495,11 +501,11 @@ struct ContentView: View {
             .sheet(item: $logJob) { BuildLogSheet(store: store, job: $0) }
             .confirmationDialog("Lancer la baguette magique sur le Mac ?", isPresented: $showsServerMaintenance,
                                 titleVisibility: .visible) {
-                Button("Recompiler puis nettoyer") {
+                Button("Recompiler, nettoyer, commit et push") {
                     Task { await store.runServerMaintenance() }
                 }
             } message: {
-                Text("Le Mac recompile les apps dont le projet est plus récent que leur release, ne garde que le build le plus récent de chaque app (les autres sont supprimés définitivement) et copie les releases macOS dans son dossier /Applications.")
+                Text("Le Mac recompile les apps dont le projet est plus récent que leur release, ne garde que le build le plus récent de chaque app (les autres sont supprimés définitivement) copie les releases macOS dans son dossier /Applications, puis ajoute tous les fichiers modifiés ou nouveaux de chaque projet à un commit et le pousse vers son dépôt distant.")
             }
             #if os(macOS)
             .confirmationDialog("Mettre à jour les apps installées ?", isPresented: $showsUpdateAll,
@@ -611,6 +617,8 @@ private struct AppRow: View {
     let isFlashing: Bool
     /// Client ou serveur pendant un prompt sur leur projet : installation impossible.
     let isUpdateBlocked: Bool
+    /// Ce client pendant la mise à jour du serveur : installation à faire ensuite.
+    let isWaitingForServer: Bool
     let install: () -> Void
     let download: () -> Void
     let open: () -> Void
@@ -712,8 +720,9 @@ private struct AppRow: View {
                    systemImage: "arrow.down.to.line", action: install)
                 .labelStyle(.iconOnly)
                 .buttonStyle(GlassActionStyle.install)
-                .disabled((Platform.isMac && downloadDisabled) || isUpdateBlocked)
+                .disabled((Platform.isMac && downloadDisabled) || isUpdateBlocked || isWaitingForServer)
                 .help(isUpdateBlocked ? ClientStore.selfUpdateBlockedMessage
+                      : isWaitingForServer ? ClientStore.serverUpdatingMessage
                       : Platform.isMac ? "Télécharger et installer dans Applications" : "Installer")
             if showsAllButtons {
                 // Mac : grisé si l'app n'est pas installée. iPad : affiché seulement si son schéma de lancement est

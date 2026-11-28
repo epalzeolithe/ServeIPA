@@ -68,8 +68,8 @@ final class OTAServer: @unchecked Sendable {
     var rebuildHandler: (@Sendable (IPABuild) async -> String?)?
     /// Indexe et valide le projet d'une app, puis pousse au besoin (`POST /api/v1/git?app=…&message=…&push=1`).
     var gitHandler: (@Sendable (IPABuild, String, Bool) async -> GitActionResult)?
-    /// Lance la baguette magique (`POST /api/v1/maintenance`) ; retourne l'identifiant du job, ou nil si le Mac est occupé.
-    var maintenanceHandler: (@Sendable () async -> String?)?
+    /// Lance la baguette magique (`POST /api/v1/maintenance`, avec `git=1` pour commiter et pousser) ; retourne l'identifiant du job, ou nil si le Mac est occupé.
+    var maintenanceHandler: (@Sendable (Bool) async -> String?)?
     /// Scanne le dossier des projets Xcode ; retourne le JSON `{"projects": […]}` (nil si le Mac est occupé).
     var projectsScanHandler: (@Sendable () async -> Data?)?
     /// Compile et ajoute un projet trouvé par le scan (identifiant du projet, plateforme).
@@ -529,8 +529,9 @@ final class OTAServer: @unchecked Sendable {
                 sendJSON(["error": "Maintenance unavailable"], status: "503 Service Unavailable", on: connection)
                 return
             }
+            let commitAndPush = Self.queryValue("git", in: query) == "1"
             Task {
-                if let jobID = await maintenanceHandler() {
+                if let jobID = await maintenanceHandler(commitAndPush) {
                     self.sendJSON(["id": jobID], status: "202 Accepted", on: connection)
                 } else {
                     self.sendJSON(["error": "A build is already running"], status: "409 Conflict", on: connection)

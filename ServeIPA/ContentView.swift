@@ -92,8 +92,8 @@ struct ContentView: View {
                 Button("Mettre à jour et nettoyer", systemImage: "wand.and.sparkles") {
                     showsCleanConfirmation = true
                 }
-                .help("Recompiler les apps dont le projet est plus récent, supprimer les anciennes versions, puis copier les releases manquantes dans /Applications")
-                .disabled((store.oldBuildCount == 0 && store.outdatedBuilds.isEmpty && store.missingInstallBuilds.isEmpty)
+                .help("Recompiler les apps dont le projet est plus récent, supprimer les anciennes versions, copier les releases manquantes dans /Applications, puis commiter et pousser les projets")
+                .disabled(store.builds.isEmpty
                           || store.isScanning
                           || store.rebuildingBundleID != nil)
             }
@@ -119,7 +119,7 @@ struct ContentView: View {
         }
         .confirmationDialog(
             store.outdatedBuilds.isEmpty && store.oldBuildCount == 0
-                ? "Installer les releases manquantes ?"
+                ? store.missingInstallBuilds.isEmpty ? "Commiter et pousser les projets ?" : "Installer les releases manquantes ?"
                 : store.outdatedBuilds.isEmpty ? "Supprimer toutes les anciennes versions ?" : "Mettre à jour et nettoyer ?",
             isPresented: $showsCleanConfirmation,
             titleVisibility: .visible
@@ -130,17 +130,17 @@ struct ContentView: View {
             if outdated > 0 {
                 // Le nettoyage est toujours fait après recompilation : le nouveau build rend l'ancienne release obsolète.
                 Button("Recompiler \(outdated) app(s) puis nettoyer") {
-                    Task { await store.runMaintenance(rebuild: true, clean: true) }
+                    Task { await store.runMaintenance(rebuild: true, clean: true, commitAndPush: true) }
                 }
             }
             if old > 0 {
                 Button("Supprimer \(old) ancien(s) build(s)", role: .destructive) {
-                    Task { await store.runMaintenance(rebuild: false, clean: true) }
+                    Task { await store.runMaintenance(rebuild: false, clean: true, commitAndPush: true) }
                 }
             }
-            if outdated == 0 && old == 0 && missing > 0 {
-                Button("Copier \(missing) app(s) dans /Applications") {
-                    Task { await store.runMaintenance(rebuild: false, clean: false) }
+            if outdated == 0 && old == 0 {
+                Button(missing > 0 ? "Copier \(missing) app(s), commiter et pousser" : "Commit et push") {
+                    Task { await store.runMaintenance(rebuild: false, clean: false, commitAndPush: true) }
                 }
             }
         } message: {
@@ -150,11 +150,15 @@ struct ContentView: View {
                 ? ""
                 : String(localized: " Les releases macOS manquantes dans /Applications seront ensuite copiées : \(missing).")
             if store.outdatedBuilds.isEmpty && store.oldBuildCount == 0 {
-                Text("Releases macOS absentes ou différentes dans /Applications : \(missing).")
+                if store.missingInstallBuilds.isEmpty {
+                    Text("Chaque projet sera indexé en entier, commité et poussé.")
+                } else {
+                    Text("Releases macOS absentes ou différentes dans /Applications : \(missing). Chaque projet sera ensuite indexé en entier, commité et poussé.")
+                }
             } else if store.outdatedBuilds.isEmpty {
-                Text("Seul le build le plus récent de chaque app est conservé. Les dossiers des autres sont supprimés définitivement du disque.\(installNote)")
+                Text("Seul le build le plus récent de chaque app est conservé. Les dossiers des autres sont supprimés définitivement du disque.\(installNote) Chaque projet sera ensuite indexé en entier, commité et poussé.")
             } else {
-                Text("Projets plus récents que leur release : \(names). Ils seront recompilés l’un après l’autre. Le nettoyage ne conserve ensuite que le build le plus récent de chaque app ; les autres dossiers sont supprimés définitivement.\(installNote)")
+                Text("Projets plus récents que leur release : \(names). Ils seront recompilés l’un après l’autre. Le nettoyage ne conserve ensuite que le build le plus récent de chaque app ; les autres dossiers sont supprimés définitivement.\(installNote) Chaque projet sera ensuite indexé en entier, commité et poussé.")
             }
         }
         .confirmationDialog(

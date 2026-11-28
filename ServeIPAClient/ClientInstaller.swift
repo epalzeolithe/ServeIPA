@@ -91,8 +91,8 @@ extension ClientStore {
                     launches: Bool = false) async -> String? {
         if isOwnApp(app) {
             await pollRebuild()
-            if isUpdateBlocked(app) {
-                return postpone(Self.selfUpdateBlockedMessage, reportsError: reportsError)
+            if let message = installBlockedMessage(app) {
+                return postpone(message, reportsError: reportsError)
             }
         }
         guard downloadingAppID == nil, inBatch || updateBatch == nil else {

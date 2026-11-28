@@ -149,3 +149,12 @@
 - Menu « … » du dernier build : « Stage et commit… » et « Stage, commit et push… », avec saisie du message.
 - `POST /api/v1/git?app=…&message=…&push=0|1` : `git add -A` et commit limités au dossier du projet, puis `git push` sur la branche courante. Sans changement, le push est tout de même tenté. Aucune demande de mot de passe possible ; chaque commande est interrompue après 90 s.
 - Refusé pendant une compilation. Autorisé pendant un prompt rClaude. Comme les autres routes, sans authentification propre : les ACL du tailnet sont le seul contrôle d'accès.
+
+## 2026-11-28 — La baguette magique commite et pousse
+
+- En dernière étape, pour chaque dossier de projet des apps servies : `git add -A` limité au dossier, commit « Build N », puis push si la branche suit une branche distante. Ignorés : hors dépôt, prompt rClaude en cours, recompilation échouée.
+- Déclenché par la baguette de ServeIPA et par celle du client (`POST /api/v1/maintenance?git=1`). La compilation de nuit et les anciens clients ne commitent rien.
+
+## 2026-11-28 — Client en attente pendant la mise à jour du serveur
+
+- Tant que le serveur se met à jour (en file ou en cours), le client ne peut pas être installé : bandeau et bouton Installer grisés, mise à jour groupée et liens refusés pour lui. La compilation reste possible.

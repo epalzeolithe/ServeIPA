@@ -131,6 +131,20 @@ extension ClientStore {
         #endif
     }()
 
+    static let serverUpdatingMessage =
+        "Mise à jour du serveur en cours : le client pourra être mis à jour ensuite."
+
+    /// Ce client attend la fin de la mise à jour du serveur, qui redémarre pendant celle-ci.
+    func isWaitingForServerUpdate(_ app: RemoteApp) -> Bool {
+        app.bundleIdentifier == Bundle.main.bundleIdentifier && isUpdatingServer
+    }
+
+    /// Raison pour laquelle cette app ne peut pas être installée maintenant, s'il y en a une.
+    func installBlockedMessage(_ app: RemoteApp) -> String? {
+        if isUpdateBlocked(app) { return Self.selfUpdateBlockedMessage }
+        return isWaitingForServerUpdate(app) ? Self.serverUpdatingMessage : nil
+    }
+
     /// Dernier build de ce client sur le serveur, quand sa release ou son projet est plus avancé que la version en
     /// cours d'exécution : c'est ce que montre déjà sa ligne dans la liste.
     var clientUpdate: RemoteApp? {

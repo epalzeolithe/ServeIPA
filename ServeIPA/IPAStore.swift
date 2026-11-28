@@ -898,7 +898,8 @@ final class IPAStore {
     /// Recompile les apps dépassées (si `rebuild`), supprime les anciennes versions (si `clean`),
     /// puis copie dans /Applications les releases manquantes.
     /// Publie un job « maintenance » que les clients suivent via `GET /api/v1/builds`.
-    func runMaintenance(rebuild requested: Bool?, clean: Bool, jobID: String = UUID().uuidString) async {
+    func runMaintenance(rebuild requested: Bool?, clean: Bool, commitAndPush: Bool = false,
+                        jobID: String = UUID().uuidString) async {
         guard !isRunningMaintenance else { return }
         isRunningMaintenance = true
         defer { isRunningMaintenance = false }
@@ -929,6 +930,17 @@ final class IPAStore {
         updateJob { $0.step = String(localized: "Copie dans /Applications…") }
         let install = await installMissingReleases()
         failures += install.failures
+        // Après les compilations : le commit contient les numéros de build obtenus.
+        var gitSummary: String?
+        if commitAndPush, cancelledJobID != jobID {
+            let git = await commitAndPushProjects(jobID: jobID, rebuildFailures: failures)
+            gitSummary = git.summary
+            failures += git.failures
+        }
+        if cancelledJobID == jobID {
+            updateJob { $0.state = "cancelled"; $0.step = String(localized: "Baguette magique annulée.") }
+            return
+        }
 
         let removed = max(0, oldBefore + rebuilt - oldBuildCount)
         var summary = String(localized: "\(max(0, rebuilt - rebuildFailures)) recompilée(s), \(removed) ancienne(s) version(s) supprimée(s), \(install.installed) copiée(s) dans /Applications.")
@@ -939,6 +951,7 @@ final class IPAStore {
         if !blockedNames.isEmpty {
             summary += " " + String(localized: "Non recompilées (prompt rClaude en cours) : \(blockedNames.formatted()).")
         }
+        if let gitSummary { summary += " " + gitSummary }
         updateJob {
             $0.step = summary
             if failures.isEmpty {
@@ -950,11 +963,69 @@ final class IPAStore {
         }
     }
 
-    /// Met en file la maintenance demandée par un client distant ; retourne l'identifiant du job.
-    func startRemoteMaintenance() -> String? {
+    /// Stage, commit et push de chaque projet des apps servies, une fois par dossier. Sont laissés de côté : les
+    /// dossiers hors dépôt, ceux sur lesquels un prompt tourne et ceux dont la recompilation vient d'échouer.
+    private func commitAndPushProjects(jobID: String, rebuildFailures: [String]) async
+        -> (summary: String, failures: [String]) {
+        guard let folderURL, let devRoot = effectiveProjectsFolder else { return ("", []) }
+        isRunningGitAction = true
+        defer { isRunningGitAction = false }
+        let apps = builds
+        let projects = await Task.detached {
+            var byFolder: [URL: (project: URL, builds: [IPABuild])] = [:]
+            for build in apps {
+                guard let project = try? IPARebuilder.findProject(bundleIdentifier: build.bundleIdentifier, appName: build.name,
+                                                                  devRoot: devRoot, ipaRoot: folderURL) else { continue }
+                byFolder[project.deletingLastPathComponent(), default: (project, [])].builds.append(build)
+            }
+            return byFolder.sorted { $0.key.path < $1.key.path }
+        }.value
+
+        var committed = 0
+        var pushed = 0
+        var skipped: [String] = []
+        var failures: [String] = []
+        for (folder, entry) in projects {
+            if cancelledJobID == jobID { break }
+            let name = folder.lastPathComponent
+            if entry.builds.contains(where: { isCompilationBlocked($0) }) {
+                skipped.append(String(localized: "\(name) (prompt en cours)"))
+                continue
+            }
+            if entry.builds.contains(where: { build in rebuildFailures.contains { $0.hasPrefix("\(build.name) (") } }) {
+                skipped.append(String(localized: "\(name) (échec précédent)"))
+                continue
+            }
+            updateJob { $0.step = String(localized: "Commit et push de \(name)…") }
+            let project = entry.project
+            let outcome: (result: GitActionResult, pushes: Bool)? = await Task.detached {
+                guard GitActions.isRepository(folder) else { return nil }
+                let pushes = GitActions.hasUpstream(folder)
+                let message = ProjectBuildNumber.read(project: project).map { "Build \($0)" } ?? "Mise à jour"
+                return (GitActions.commit(folder: folder, message: message, push: pushes), pushes)
+            }.value
+            guard let outcome else { continue }
+            if outcome.result.committed { committed += 1 }
+            if !outcome.result.succeeded {
+                failures.append("\(name) : \(outcome.result.message)")
+            } else if outcome.pushes {
+                pushed += 1
+            } else {
+                skipped.append(String(localized: "\(name) (sans dépôt distant, non poussé)"))
+            }
+        }
+        lastGitRead = .distantPast
+        var summary = String(localized: "Git : \(committed) commit(s), \(pushed) projet(s) à jour sur le dépôt distant.")
+        if !skipped.isEmpty { summary += " " + String(localized: "À noter : \(skipped.formatted()).") }
+        return (summary, failures)
+    }
+
+    /// Met en file la maintenance demandée par un client distant ; retourne l'identifiant du job. Les commits et
+    /// push ne sont faits que si le client les demande (et a donc prévenu l'utilisateur).
+    func startRemoteMaintenance(commitAndPush: Bool) -> String? {
         enqueue(app: String(localized: "Baguette magique"), platform: "Mac", kind: "maintenance",
-                key: "maintenance") { [weak self] jobID in
-            await self?.runMaintenance(rebuild: nil, clean: true, jobID: jobID)
+                key: commitAndPush ? "maintenance/git" : "maintenance") { [weak self] jobID in
+            await self?.runMaintenance(rebuild: nil, clean: true, commitAndPush: commitAndPush, jobID: jobID)
         }
     }
 
@@ -1046,8 +1117,8 @@ final class IPAStore {
                 await self?.runGitAction(build, message: message, push: push)
                     ?? GitActionResult(succeeded: false, message: "ServeIPA n’est pas disponible.")
             }
-            newServer.maintenanceHandler = { [weak self] in
-                await self?.startRemoteMaintenance()
+            newServer.maintenanceHandler = { [weak self] commitAndPush in
+                await self?.startRemoteMaintenance(commitAndPush: commitAndPush)
             }
             newServer.projectsScanHandler = { [weak self] in
                 await self?.remoteProjectsJSON()

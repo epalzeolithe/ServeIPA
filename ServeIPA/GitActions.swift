@@ -4,6 +4,8 @@ import Foundation
 nonisolated struct GitActionResult: Sendable {
     let succeeded: Bool
     let message: String
+    /// Un commit a été créé (même si le push a ensuite échoué).
+    var committed = false
 }
 
 /// Indexe et valide les changements du dossier d'un projet, puis les pousse au besoin.
@@ -21,6 +23,7 @@ nonisolated enum GitActions {
         guard added.status == 0 else { return failure("L’indexation a échoué.", added.output) }
 
         var done = "Aucune modification à valider."
+        var created = false
         // Code 0 : rien n'est indexé dans ce dossier.
         if run(["diff", "--cached", "--quiet", "--", "."], in: folder).status != 0 {
             let committed = run(["commit", "-m", message, "--", "."], in: folder)
@@ -28,11 +31,26 @@ nonisolated enum GitActions {
             let hash = run(["rev-parse", "--short", "HEAD"], in: folder).output
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             done = "Commit \(hash) créé."
+            created = true
         }
-        guard push else { return GitActionResult(succeeded: true, message: done) }
+        guard push else { return GitActionResult(succeeded: true, message: done, committed: created) }
         let pushed = run(["push"], in: folder)
-        guard pushed.status == 0 else { return failure("\(done) Le push a échoué.", pushed.output) }
-        return GitActionResult(succeeded: true, message: "\(done) Push effectué.")
+        guard pushed.status == 0 else {
+            var result = failure("\(done) Le push a échoué.", pushed.output)
+            result.committed = created
+            return result
+        }
+        return GitActionResult(succeeded: true, message: "\(done) Push effectué.", committed: created)
+    }
+
+    /// Vrai si le dossier est dans un dépôt.
+    static func isRepository(_ folder: URL) -> Bool {
+        run(["rev-parse", "--is-inside-work-tree"], in: folder).status == 0
+    }
+
+    /// Vrai si la branche courante suit une branche distante, où pousser.
+    static func hasUpstream(_ folder: URL) -> Bool {
+        run(["rev-parse", "--symbolic-full-name", "@{upstream}"], in: folder).status == 0
     }
 
     private static func failure(_ summary: String, _ output: String) -> GitActionResult {

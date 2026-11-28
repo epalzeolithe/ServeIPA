@@ -236,8 +236,8 @@ final class ClientStore {
         #if !os(macOS)
         if isOwnApp(app) {
             await pollRebuild()
-            guard !isUpdateBlocked(app) else {
-                errorMessage = Self.selfUpdateBlockedMessage
+            if let message = installBlockedMessage(app) {
+                errorMessage = message
                 return
             }
         }
@@ -279,7 +279,7 @@ final class ClientStore {
     /// Dernier build de chaque app installée dont la version installée est plus ancienne que celle du serveur.
     var outdatedInstalledApps: [RemoteApp] {
         AppGroup.grouping(apps).map(\.latest).filter {
-            !isUpdateBlocked($0) && installedApp($0)?.record.isOlder(than: $0) == true
+            installBlockedMessage($0) == nil && installedApp($0)?.record.isOlder(than: $0) == true
         }
     }
 
@@ -658,7 +658,12 @@ final class ClientStore {
         guard compilingInstalls.insert(app.bundleIdentifier).inserted else { return }
         defer { compilingInstalls.remove(app.bundleIdentifier) }
         // État des prompts relu à l'instant : le dernier relevé peut dater.
-        if app.projectBuild != nil { await pollRebuild() }
+        if app.projectBuild != nil || isOwnApp(app) { await pollRebuild() }
+        // Inutile de compiler un client qui ne pourrait pas être installé ensuite.
+        if isWaitingForServerUpdate(app) {
+            errorMessage = Self.serverUpdatingMessage
+            return
+        }
         guard compilesBeforeInstalling(app) else {
             await install(app)
             return
@@ -686,11 +691,13 @@ final class ClientStore {
     }
 
     /// Lance la baguette magique sur le Mac : recompile les apps dont le projet est plus récent,
-    /// supprime les anciennes versions et copie les releases macOS dans /Applications du Mac.
+    /// supprime les anciennes versions, copie les releases macOS dans /Applications du Mac, puis commite et pousse
+    /// les projets.
     func runServerMaintenance() async {
         do {
             let base = try ServerAddress.parse(address)
-            let data = try await request(base.appending(path: "api/v1/maintenance"), method: "POST")
+            let url = base.appending(path: "api/v1/maintenance").appending(queryItems: [URLQueryItem(name: "git", value: "1")])
+            let data = try await request(url, method: "POST")
             struct Started: Decodable { let id: String }
             track(try JSONDecoder().decode(Started.self, from: data).id)
             await pollRebuild()
